@@ -7,28 +7,14 @@ from pathlib import Path
 from tkinter import ttk
 
 from .audio import list_microphones
+from .autosave import render_segments
 from .ui import BG, configure_dark_style, enable_dpi_awareness, style_window_frame
-
-
-def render_segments(segments):
-    parts = []
-    speaker = session = None
-    for segment in segments:
-        known = segment.speaker if segment.speaker not in {None, "UU", "SU", ""} else None
-        if parts and (
-            (session and segment.session_id != session) or (known and speaker and known != speaker)
-        ):
-            parts.append("\n\n")
-        parts.append(segment.text)
-        if known:
-            speaker = known
-        session = segment.session_id
-    return "".join(parts)
 
 
 class ComparisonApp:
     def __init__(self, root, experiment, device=None):
         self.root, self.experiment = root, experiment
+        experiment.ensure_autosave()
         self.devices = []
         self.requested_device = device
         self.closing = False
@@ -86,6 +72,7 @@ class ComparisonApp:
         ttk.Label(root, textvariable=self.error, foreground="#ff9b9b", wraplength=1300).pack(
             fill="x", padx=10
         )
+        ttk.Label(root, text=f"自動保存先: {experiment.autosave.directory}").pack(fill="x", padx=10)
         panels = ttk.Frame(root, padding=10)
         panels.pack(fill="both", expand=True)
         providers = ["openai", "speechmatics"] if experiment.compare else ["speechmatics"]
@@ -248,7 +235,8 @@ class ComparisonApp:
             + (f" | OpenAI: {oa['state']} / EN {oa.get('english_connection', '—')}" if oa else "")
         )
         self.error.set(
-            snapshot["error"]
+            self.experiment.autosave.error
+            or snapshot["error"]
             or sm["error"]
             or sm["warning"]
             or (oa["error"] or oa.get("english_error", "") if oa else "")
@@ -274,6 +262,10 @@ class ComparisonApp:
                     self.update_text(("openai", lang), h.rendered_text(lang))
                 self.revisions["openai"] = revision
         if self.closing and not self.experiment.active:
+            self.experiment.autosave.request_close()
+            if self.experiment.autosave.active:
+                self.root.after(75, self.poll)
+                return
             self.root.destroy()
             return
         self.root.after(75, self.poll)

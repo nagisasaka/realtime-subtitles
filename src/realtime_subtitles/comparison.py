@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .audio import LatestQueue, Microphone, list_microphones
+from .autosave import TranscriptAutosave
 from .realtime_api import RealtimeClient
 from .speechmatics_api import ENDPOINT, EVENTS, SpeechmaticsClient, SubtitleSegment
 
@@ -105,6 +106,15 @@ class Experiment:
         self.state = "STOPPED"
         self.openai_cursor = 0
         self.frames_dispatched = 0
+        self.autosave = None
+
+    def ensure_autosave(self):
+        if self.autosave is None:
+            histories = {"speechmatics": self.speechmatics.history}
+            if self.openai:
+                histories["openai"] = self.openai.history
+            self.autosave = TranscriptAutosave(histories)
+        return self.autosave
 
     def _borrow(self, device=None):
         self.borrowed = BorrowedMicrophone(self)
@@ -281,9 +291,12 @@ class Experiment:
         self.join(20)
         if self.openai:
             self.openai._diarization.close()
+        if self.autosave:
+            self.autosave.close()
 
     def snapshot(self):
         return {
+            "autosave": self.autosave.snapshot() if self.autosave else None,
             "state": self.state,
             "error": self.error,
             "speechmatics": self.speechmatics.snapshot(),
@@ -345,6 +358,8 @@ def main():
 
             run_gui(experiment, args.device)
         else:
+            experiment.ensure_autosave()
+            print(f"自動保存先: {experiment.autosave.directory}", flush=True)
             experiment.start(args.device)
             deadline = time.monotonic() + args.seconds if args.seconds else float("inf")
             last = None
@@ -356,6 +371,7 @@ def main():
                     snapshot["speechmatics"]["state"],
                     snapshot["speechmatics"]["error"],
                     snapshot["speechmatics"]["warning"],
+                    experiment.autosave.error,
                 )
                 if states != last:
                     print(json.dumps(snapshot, ensure_ascii=False), flush=True)
@@ -372,7 +388,15 @@ def main():
             experiment.speechmatics.history.save(args.save)
         if log:
             log.close()
-    return 1 if experiment.error or experiment.speechmatics.error else 0
+    return (
+        1
+        if (
+            experiment.error
+            or experiment.speechmatics.error
+            or (experiment.autosave and experiment.autosave.error)
+        )
+        else 0
+    )
 
 
 if __name__ == "__main__":

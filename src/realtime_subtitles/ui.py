@@ -12,6 +12,7 @@ from pathlib import Path
 from tkinter import font, ttk
 
 from .audio import list_microphones
+from .autosave import TranscriptAutosave
 from .realtime_api import RealtimeClient, State
 from .settings import Settings
 from .subtitle_buffer import rolling_text
@@ -195,6 +196,7 @@ class SubtitleApp:
     def __init__(self, root, *, client=None, settings_file=None, device_loader=list_microphones):
         self.root = root
         self.client = client if client is not None else RealtimeClient()
+        self.autosave = TranscriptAutosave({"openai": self.client.history})
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
         self.device_loader = device_loader
@@ -342,6 +344,9 @@ class SubtitleApp:
             text="話者交代を検出すると、字幕の対応位置に後から空行を追加します。",
             wraplength=650,
         ).pack(anchor="w", pady=(5, 0))
+        ttk.Label(details, text=f"自動保存先: {self.autosave.directory}", wraplength=500).pack(
+            fill="x"
+        )
         ttk.Button(details, text="Diagnostics", command=self.show_diagnostics).pack(anchor="e")
         status = ttk.Frame(self.root, padding=(12, 7, 12, 4))
         status.pack(fill="x")
@@ -761,7 +766,13 @@ class SubtitleApp:
         english_state = snapshot.get("english_connection")
         if snapshot["state"] == State.RUNNING and english_state not in {None, "RUNNING"}:
             self.status_var.set(f"RUNNING / EN {english_state}")
-        self.error_var.set(snapshot["error"] or snapshot.get("english_error") or self.local_error)
+        snapshot["autosave"] = self.autosave.snapshot()
+        self.error_var.set(
+            self.autosave.error
+            or snapshot["error"]
+            or snapshot.get("english_error")
+            or self.local_error
+        )
         self.error_label.configure(wraplength=max(100, self.root.winfo_width() - 24))
         busy = self.client.active or self.refreshing or self.closing
         self.start_button.configure(state="disabled" if busy else "normal")
@@ -789,6 +800,10 @@ class SubtitleApp:
                 self.diagnostic_text.configure(state="disabled")
                 self._last_diagnostic = diagnostic
         if self.closing and not self.client.active and not self.saving:
+            self.autosave.request_close()
+            if self.autosave.active:
+                self._poll_id = self.root.after(50, self._poll)
+                return
             self.root.destroy()
             return
         self._poll_id = self.root.after(50, self._poll)

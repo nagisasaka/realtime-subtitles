@@ -15,7 +15,8 @@ WSLg / PulseAudio / ALSA の入力にも依存しません。マイク取得と�
 安定版の復元ポイントは `openai-stable-v1` → `1e95fe5b433c846a1534d25301060b17416e8930` です。
 `main` とこのtagは変更しません。通常の `python -m realtime_subtitles` は従来のOpenAI版を起動します。
 以下は別エントリーポイントから起動する実験機能で、既定backendの切り替えではありません。
-既存の `audio.py` / `realtime_api.py` / `transcription.py` / `subtitle_buffer.py` / `ui.py` はbaselineと同一です。
+既存の `audio.py` / `realtime_api.py` / `transcription.py` / `subtitle_buffer.py` はbaselineと同一です。
+保存処理は独立workerとして追加し、通常のOpenAI起動・比較実験起動の両方で自動保存を有効にしています。
 
 ### 構成とAPI仕様
 
@@ -90,7 +91,8 @@ $env:OPENAI_API_KEY=[Environment]::GetEnvironmentVariable("OPENAI_API_KEY","User
 
 ### 比較ログと保存
 
-通常は字幕をRAMに保持し、音声ファイルは作りません。Speechmatics側に自動ファイル保存はありません。
+認識・翻訳結果は**標準で自動保存**します（GUI・consoleとも）。音声ファイルは作りません。
+保存先・保存間隔・partialの扱いは下記「字幕の自動保存」を参照してください。
 `Save finals` は `%USERPROFILE%\RealtimeSubtitles\Comparisons` へ日時付きの新規ファイルを作り、
 Speechmaticsのfinal segmentと、比較時はOpenAIの従来形式の履歴をそれぞれ保存します。partialは保存対象に含めません。
 OpenAI側の既存diarization-debug.logは比較中も従来通り生成されます。
@@ -162,16 +164,44 @@ git worktree add ../jimaku-openai-stable openai-stable-v1
 | データ | 保存方法・保存先 |
 | --- | --- |
 | マイク音声 | **通常動作では音声ファイルを保存しません。** 音声キュー・30秒のring buffer・処理待ち/処理中windowはRAM上に保持します。APIへ送るWAVも`BytesIO`で作り、ディスクの一時WAVは作りません |
-| 英語・日本語の字幕全文と話者境界 | アプリのRAMに保持。**定期自動保存・終了時自動保存・再起動時の復元は未実装**です。設定画面の **Save → 保存** で明示的に書き出します |
+| 英語・日本語の字幕全文と話者境界 | **自動保存**。`%USERPROFILE%\RealtimeSubtitles\Autosave\起動日時-ID\` にJSONLを約0.5秒ごと、読み返し用TXTを約5秒ごとに保存。正常終了時も最終書き出しします。画面への履歴自動復元は未実装です |
 | 手動保存ファイル | 既定は `%USERPROFILE%\RealtimeSubtitles\Transcripts\subtitles-日時.jsonl`。保存画面でパスや拡張子を変更できます。`.txt`は話者改行付き本文、`.jsonl`は元delta・時刻・表示用本文・境界metadataを保存します。既存ファイルは上書きしません |
 | ウィンドウ・フォント・マイク等の設定 | **自動保存**。変更から約500ms後および終了時に `%APPDATA%\RealtimeSubtitles\settings.json` へ保存します |
 | 話者分離の診断ログ | 話者分離有効時に**自動保存**。`%APPDATA%\RealtimeSubtitles\diarization-debug.log`。segmentの認識文章、話者ラベル、時刻、境界推定、エラーを含みます。約2MB×最大3ファイルのローテーション |
 | Realtimeのrawイベントログ | 標準起動では無効。`--event-log パス` 指定等で有効化した場合に**自動追記**。EN/JAの認識文章を含みますが、音声payload・APIキー・Authorization headerは記録しません。現在の実装にはファイルのサイズ上限・ローテーションがありません |
 
-StopやClearは保存操作ではありません。Stop/Startを繰り返しても同じアプリ内の字幕履歴は残り、
-Clearは表示を消すだけなので過去分もSaveの対象です。保存後に届いた字幕・話者境界は既存の保存ファイルへ自動追記しません。
-アプリ終了・異常終了後に字幕全文を確実に残すには、事前にSaveが必要です。
-診断ログは字幕の一部を残しますが、全文保存や再開用データの代わりにはなりません。
+### 字幕の自動保存
+
+**Saveボタンを押す必要はありません。** 起動ごとに次の新しいフォルダーを作り、過去の起動分を上書きしません。
+
+```text
+%USERPROFILE%\RealtimeSubtitles\Autosave\起動日時-ID\
+    openai.jsonl          # OpenAIの元delta・時刻・話者境界snapshot
+    openai.txt            # 読み返し用のEN/JA本文（話者改行付き）
+    speechmatics.jsonl    # Speechmaticsの確定segmentと未確定snapshot
+    speechmatics.txt      # Speechmaticsの確定EN/JA本文（話者改行付き）
+```
+
+使用中のbackendのファイルだけを作成します。保存先はOpenAI版の設定画面・Diagnostics、比較版の画面、consoleの起動メッセージで確認できます。
+
+- 独立workerが履歴を約**0.5秒間隔**で読み取りJSONLへ追記し、各batchでflush・fsyncします。
+  音声処理やWebSocketの送信方式は変更しません。破棄可能な診断queueは使わず、確定履歴をcursorで追跡します。
+- 読み返し用の`.txt`は変更がある間約**5秒間隔**で一時ファイルから置換します。正常終了時に残りも書き出します。
+  強制終了・電源断では未書き込みの直近分が失われる可能性があります。直近の確認にはJSONLを使ってください。
+  強制終了中に切れたJSONLの最終行は無視し、それ以前の完全な行を読み取れます。
+- JSONLの`kind="transcript"`の`record`が元の確定履歴です。OpenAIはappend-only delta、Speechmaticsは`is_final=true`のsegmentです。
+  Speechmaticsの`partial_snapshot`は未確定部分の**置換snapshot**で、確定本文へ足し合わせません。
+  polling間に更新・消去された短命なpartialは残らない場合があります。全partialイベントの比較には従来の`--event-log`を使います。
+- OpenAIの`speaker_boundaries_snapshot`は最新版を採用します。本文は書き換えず、後追い話者境界をmetadataとして追記します。
+- Stop/Startしても同じ起動内では同じフォルダーへ継続します。Clearは表示だけを消し、自動保存済みの履歴を削除しません。
+  手動Saveも引き続き使えます（手動ファイルはその時点のsnapshotです）。
+- 保存失敗は画面に**自動保存エラー**を表示して再試行します。字幕は継続し、成功するまで確定履歴の保存cursorを進めません。
+  保存失敗中に終了するとウィンドウは最終保存を待ちます。空き容量・フォルダー権限を直してください。
+- 音声、APIキー、Authorization headerは自動保存しません。字幕はローカルの平文ファイルです。
+  自動削除・容量制限・再起動時の画面への履歴読み込みは未実装です。不要な履歴は保存フォルダーで削除してください。
+  安定版tag `openai-stable-v1` は自動保存追加前の状態を維持しています。
+
+診断ログは調査用であり、字幕自動保存とは別です。
 
 **開発中の現在のアプリではrawログが有効**になっています（2026-10-06確認）。
 保存先は `C:\workspace\realtime-subtitles\diagnostics\speaker-timing-check.jsonl` です。

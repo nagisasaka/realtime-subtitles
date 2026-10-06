@@ -4,6 +4,7 @@ import sys
 import time
 
 from .audio import Microphone, list_microphones
+from .autosave import TranscriptAutosave
 from .realtime_api import RealtimeClient, State
 
 
@@ -14,6 +15,8 @@ def console(args):
         source_mode=args.source_mode,
         diarization_enabled=not args.no_diarization,
     )
+    autosave = TranscriptAutosave({"openai": client.history})
+    print(f"自動保存先: {autosave.directory}", flush=True)
     client.start(args.device, args.noise_reduction)
     seen = 0
     last_state = None
@@ -22,9 +25,16 @@ def console(args):
     try:
         while client.active:
             snapshot = client.snapshot()
-            notice = (snapshot["state"], snapshot["error"], snapshot.get("english_error", ""))
+            notice = (
+                snapshot["state"],
+                snapshot["error"],
+                snapshot.get("english_error", ""),
+                autosave.error,
+            )
             if notice != last_state:
-                print(f"[{snapshot['state']}] {snapshot['error']} {notice[2]}", flush=True)
+                print(
+                    f"[{snapshot['state']}] {snapshot['error']} {notice[2]} {notice[3]}", flush=True
+                )
                 last_state = notice
             records = client.history.records(seen)
             for record in records:
@@ -56,9 +66,12 @@ def console(args):
             print(json.dumps(final_snapshot, ensure_ascii=False), flush=True)
         for record in client.history.records(seen):
             print(f"{record['language'].upper()} [{record['elapsed_ms']} ms]: {record['delta']}")
+        client._diarization.close()
+        if not autosave.close():
+            failed = True
+            print(autosave.error or "自動保存の終了待機がタイムアウトしました", file=sys.stderr)
         if args.save:
             client.history.save(args.save)
-        client._diarization.close()
     return 1 if failed else 0
 
 

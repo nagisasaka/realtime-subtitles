@@ -190,6 +190,14 @@ class SegmentHistory:
         with self.lock:
             return self.revision, list(self.finals), {k: list(v) for k, v in self.partials.items()}
 
+    def autosave_records(self, start=0):
+        with self.lock:
+            return (
+                list(self.finals[start:]),
+                {k: list(v) for k, v in self.partials.items()},
+                self.session_id,
+            )
+
     def save(self, path):
         _, finals, _ = self.snapshot()
         with Path(path).open("x", encoding="utf-8") as output:
