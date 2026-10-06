@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Secrets
+.env
+.env.*
+!.env.example
+credentials.json
+credentials/
+secrets/
+*.pem
+*.key
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Logs and runtime data
+*.log
+logs/
+diagnostics/
+transcripts/
+recordings/
+audio/
+*.jsonl
+*.wav
+*.pcm
+*.raw
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.dmp
+*.dump
+core
+core.*
+settings.json
+
+# Build / packaging
+build/
+dist/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
