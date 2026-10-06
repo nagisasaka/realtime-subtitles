@@ -10,6 +10,146 @@ Windows 11 **ネイティブのマイク入力**から英語原文と日本語�
 PC再生音のloopback取得、翻訳音声の再生、Qt、Electronは使いません。
 WSLg / PulseAudio / ALSA の入力にも依存しません。マイク取得とアプリ起動はWindows Pythonで行います。
 
+## Speechmatics比較実験（`experiment/speechmatics`）
+
+安定版の復元ポイントは `openai-stable-v1` → `1e95fe5b433c846a1534d25301060b17416e8930` です。
+`main` とこのtagは変更しません。通常の `python -m realtime_subtitles` は従来のOpenAI版を起動します。
+以下は別エントリーポイントから起動する実験機能で、既定backendの切り替えではありません。
+既存の `audio.py` / `realtime_api.py` / `transcription.py` / `subtitle_buffer.py` / `ui.py` はbaselineと同一です。
+
+### 構成とAPI仕様
+
+- Speechmaticsは公式の現行Python SDK `speechmatics-rt` を使用します。検証バージョンは **1.2.1**。
+  `TranslationConfig` と英日4種類のイベントが公開されているため、独自WebSocket実装は使いません。
+- 接続先は `wss://global.rt.speechmatics.com/v2/`（近いregionへルーティング）。`--endpoint` で公式の地域別endpointも指定できます。
+- `transcription_config`: `model="enhanced"`, `language="en"`, `diarization="speaker"`, `enable_partials=true`, `max_delay=4.0`。
+  精度優先の初期設定です。遅延を比較する場合は `--max-delay 0.7` / `1` / `2` / `3` / `4` を指定します。
+- `translation_config`: `target_languages=["ja"]`, `enable_partials=true`。
+- マイクは既存のWindows sounddevice経路で1つだけ開き、native rateのfloat32から既存converterで24kHz mono PCM16へ変換します。
+  Speechmaticsへは200ms・9,600bytesをbinary audioとして送ります。PyAudio・WSLg入力は使いません。
+- `--compare` では同じ取得済みPCMを独立したbounded queueへ分岐し、OpenAIとSpeechmaticsへ送ります。
+  OpenAIには既存のmicrophone factory注入箇所から取得済み音声を渡すだけで、既存のsession設定・EN/JA受信・再接続コードは変更しません。
+  OpenAIの既存の英語用接続と遅延話者分離も維持するため、比較中は両社の利用料が発生します。
+- Speechmaticsの英語は `AddPartialTranscript` / `AddTranscript`、日本語は `AddPartialTranslation` / `AddTranslation` を区別します。
+  partialは未確定部分を**置換**し、finalは確定履歴へ追加します。final確定時は対応範囲のpartialを除き、既に届いた後続範囲のpartialは残します。
+- `SubtitleSegment` にbackend・language・text・is_final・start_ms・end_ms・speaker・session_id・受信monotonic時刻を保持します。
+  ENはword/punctuationごとのspeaker・時刻、JAは各translation resultのspeaker・時刻を取得します。
+  SDKのtranscript文字列だけへ変換せずraw eventのresultsを解析します。ENの空白・句読点は`metadata.transcript`を維持します。
+- 時刻はAPIの秒をmsに換算し、**セッション内の音声時刻**として扱います。再接続後は別session_idなので、前の時刻・話者IDと混同しません。
+  `received_monotonic_ms`は受信時刻であり音声時刻ではありません。
+  OpenAIの正規化イベントでは不明なstart_ms・end_ms・speakerは`null`。`elapsed_ms`から区間時刻を捏造しません。
+  OpenAIの`is_final=true`は本アプリが保持するappend-only deltaを表し、Speechmaticsのfinalイベントと同等の発話確定通知という意味ではありません。
+- Speechmatics側で後追いdiarization・fuzzy alignment・時刻推定は行いません。APIのspeakerだけを使い、確定字幕の話者交代に空行を表示します。
+  人物ごとの固定色や話者見出しは表示しません。speakerが不明なら交代を推測しません。
+- SDK 1.2.1ではAudioAdded受信時に内部送信カウンターが書き換わるため、終了時は公開`send_message()`で
+  自前の実送信数を`EndOfStream.last_seq_no`へ指定し、`EndOfTranscript`を最大8秒待ちます。
+  Speechmaticsだけの再接続は5秒から最大30秒のbackoff、最大8回。Stopは接続待ち・backoff中でも中断できます。
+  認証/設定エラーを表示し、Speechmaticsの失敗でOpenAIの正常な接続は再起動しません。
+
+### Windowsで導入・起動
+
+既存の安定版と分けた実機確認先は **`C:\workspace\realtime-subtitles-speechmatics`** です。
+WSL側のソースをコピーする場合（Windowsのvenvは別途Windows Pythonで作成）:
+
+```bash
+bash scripts/sync-to-windows.sh /mnt/c/workspace/realtime-subtitles-speechmatics
+```
+
+Windows PowerShell:
+
+```powershell
+cd C:\workspace\realtime-subtitles-speechmatics
+python -m venv .venv-win
+.\.venv-win\Scripts\python.exe -m pip install -e ".[speechmatics,dev]"
+
+# 設定済みのWindowsユーザー環境変数を、このPowerShellにも反映。値は表示しません。
+$env:SPEECHMATICS_API_KEY=[Environment]::GetEnvironmentVariable("SPEECHMATICS_API_KEY","User")
+$env:OPENAI_API_KEY=[Environment]::GetEnvironmentVariable("OPENAI_API_KEY","User")
+
+# Phase 1: Speechmaticsだけでコンソール確認（OpenAI keyは不要）
+.\.venv-win\Scripts\python.exe -m realtime_subtitles.comparison --seconds 30
+
+# 同じマイク入力を両社へ送り、コンソール比較
+.\.venv-win\Scripts\python.exe -m realtime_subtitles.comparison --compare --seconds 60
+
+# 比較ウィンドウ（起動後にStart。右: Speechmatics、左: OpenAI）
+.\.venv-win\Scripts\python.exe -m realtime_subtitles.comparison --compare --gui
+
+# Speechmaticsだけのウィンドウ
+.\.venv-win\Scripts\python.exe -m realtime_subtitles.comparison --gui
+```
+
+`SPEECHMATICS_API_KEY` はSpeechmatics portalで取得し、Windowsユーザー環境変数へ設定してください。
+既存の`OPENAI_API_KEY`は変更不要です。実験キーをファイルへ保存したり、チャットへ貼ったりする必要はありません。
+`scripts/run-speechmatics.ps1` も用意していますが、PowerShellのscript実行が禁止されている環境では上記のPython直接起動を使えます。
+
+`--list-devices` でWindows入力一覧、`--device 番号` でマイクを指定できます。GUIではドロップダウンから選択します。
+比較時は旧OpenAIアプリの録音をStopにし、比較プロセス1つだけをStartしてください。旧ウィンドウを閉じる必要はありません。
+実験ウィンドウは既存overlayとは別のUIで、EN/JAサイズ・最前面・手動スクロール・最新追従に対応します。
+薄い文字が未確定partialです。実験UIの位置・フォント設定は現段階では保存せず、安定版のsettings.jsonも書き換えません。
+
+### 比較ログと保存
+
+通常は字幕をRAMに保持し、音声ファイルは作りません。Speechmatics側に自動ファイル保存はありません。
+`Save finals` は `%USERPROFILE%\RealtimeSubtitles\Comparisons` へ日時付きの新規ファイルを作り、
+Speechmaticsのfinal segmentと、比較時はOpenAIの従来形式の履歴をそれぞれ保存します。partialは保存対象に含めません。
+OpenAI側の既存diarization-debug.logは比較中も従来通り生成されます。
+
+partialの変化も含めて後から比べたい場合は、明示的にイベントログを指定します:
+
+```powershell
+New-Item -ItemType Directory -Force diagnostics | Out-Null
+.\.venv-win\Scripts\python.exe -m realtime_subtitles.comparison --compare --seconds 60 --event-log diagnostics\comparison.jsonl --save diagnostics\speechmatics-finals.jsonl
+```
+
+- `--event-log`: 英日partial/finalのraw JSONと正規化segment、OpenAIのdelta、受信UTC/monotonic時刻、開始終了時の診断情報をJSONLで保存。
+  字幕文章を含みます。APIキー・Authorization header・音声bytesは記録しません。
+- `--save`: 終了時にSpeechmaticsの**finalだけ**をJSONL保存。話者・時刻を保持します。
+- 同名ファイルは上書きしません。別のファイル名を指定してください。ログ書込は独立workerとbounded queueで行います。
+- `diagnostics/`と`*.jsonl`はGit対象外です。ファイルサイズのローテーションは未実装なので、比較ごとに終了して別ファイルにしてください。
+- canonical timestampは音声区間時刻、ログの受信時刻は到着時刻です。両者の差をそのまま厳密なend-to-end latencyとみなさないでください。
+  接続開始・キューdrop・APIのセッション時刻基準を考慮した遅延統計や正解文章に対するWER集計は未実装です。
+
+### 実測・テスト状況（2026-10-06）
+
+Windows: **62 passed**。WSL: **56 passed / 6 skipped**（Windows専用テスト）。Ruff lint/format・両環境の`pip check`も通過。
+
+- Windowsネイティブの実マイク、44100Hz mono float32 → 24000Hz PCM16でSpeechmaticsの実APIに接続。
+  最初の30秒検証で EN partial 75 / final 13、JA partial 1 / final 3 を受信。
+  JAのraw resultにもspeakerとstart_time/end_timeがあることを確認しました。
+- 比較ウィンドウで同じPCMを両社へ送信。約1分＋Stop/Start後の約30秒で、Speechmatics累計
+  EN partial 229 / final 45、JA partial 1 / final 5、OpenAI EN/JA delta合計379を受信しました。
+  2回ともSpeechmatics送信queue dropは0、終了時はSTOPPED、接続エラーなしでした。
+  時間指定は接続待ちも含むため、送信済み音声の長さは壁時計より短くなります。
+- 英語/日本語partial置換、final確定と色変更、wordの話者保持、翻訳の時刻保持、重複final抑制、再接続、
+  EOS実送信数、Start/Stop/Start、認証エラーの秘匿、1つのマイクから同一bytesのfan-out、
+  Speechmatics障害時のOpenAI継続、Windows Tkのスクロール維持をテストします。
+- 実API受信・Windows表示・同時比較が可能であることの確認です。会話内容の正解ラベルを用いた精度評価ではなく、
+  現時点でどちらが高精度かは断定しません。JA partialは常時出るとは限らず、finalのみの区間もあります。
+
+```powershell
+.\.venv-win\Scripts\python.exe -m pytest -q
+.\.venv-win\Scripts\python.exe -m ruff check .
+```
+
+### 安定版の復元
+
+実験branchの変更をコミットした上で `git switch main`、または実験を残したまま別作業フォルダに安定版を取り出せます:
+
+```bash
+git worktree add ../jimaku-openai-stable openai-stable-v1
+```
+
+そのフォルダから従来の環境構築・起動手順を使います。`openai-stable-v1` tagを付け替える必要はありません。
+実機確認用の旧 `C:\workspace\realtime-subtitles` は引き続き安定版のソースです。
+
+確認した公式資料:
+[Realtime quickstart](https://docs.speechmatics.com/speech-to-text/realtime/quickstart)、
+[Realtime API schema](https://docs.speechmatics.com/api-ref/realtime-transcription-websocket)、
+[Translation](https://docs.speechmatics.com/speech-to-text/features/translation)、
+[Realtime diarization](https://docs.speechmatics.com/speech-to-text/realtime/realtime-diarization)、
+[推奨SDK](https://docs.speechmatics.com/integrations-and-sdks/sdks)。
+
 ## 現在の動作・保存・通信・料金（2026-10-06確認）
 
 現行の標準構成は **英語用WebSocket + 日本語用WebSocket + 遅延する話者分離HTTP API** です。
