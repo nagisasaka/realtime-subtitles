@@ -13,6 +13,8 @@ dependencies = [
   "sounddevice>=0.5.1,<0.6",
   "soxr>=0.5,<2",
   "websockets>=15,<18",
+  "speechmatics-rt>=1.2.1,<2",
+  "openai>=2,<3",
 ]
 
 [project.optional-dependencies]

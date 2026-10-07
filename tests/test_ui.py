@@ -4,6 +4,8 @@ import time
 
 import pytest
 
+from realtime_subtitles.realtime_api import RealtimeClient
+
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk test")
 
 
@@ -36,6 +38,7 @@ def test_native_tk_render_clear_settings_and_error(tmp_path, monkeypatch):
     root.report_callback_exception = lambda *args: errors.append(args)
     app = SubtitleApp(
         root,
+        client=RealtimeClient(),
         settings_file=tmp_path / "settings.json",
         device_loader=lambda: [InputDevice(1, "Test microphone", "Windows WASAPI", 48000, 2, True)],
     )
@@ -148,7 +151,12 @@ def test_save_panel_keeps_captions_responsive_and_recovers_errors(tmp_path, monk
     monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **kw: pytest.fail("Native dialog"))
     enable_dpi_awareness()
     root = tk.Tk()
-    app = SubtitleApp(root, settings_file=tmp_path / "settings.json", device_loader=lambda: [])
+    app = SubtitleApp(
+        root,
+        client=RealtimeClient(),
+        settings_file=tmp_path / "settings.json",
+        device_loader=lambda: [],
+    )
     errors = []
     root.report_callback_exception = lambda *args: errors.append(args)
     release = threading.Event()
@@ -227,7 +235,12 @@ def test_delayed_speaker_breaks_update_only_metadata_and_keep_scroll(tmp_path):
 
     enable_dpi_awareness()
     root = tk.Tk()
-    app = SubtitleApp(root, settings_file=tmp_path / "settings.json", device_loader=lambda: [])
+    app = SubtitleApp(
+        root,
+        client=RealtimeClient(),
+        settings_file=tmp_path / "settings.json",
+        device_loader=lambda: [],
+    )
 
     def pump():
         deadline = time.monotonic() + 0.15

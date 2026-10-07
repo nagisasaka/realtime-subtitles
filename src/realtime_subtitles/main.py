@@ -4,62 +4,81 @@ import sys
 import time
 
 from .audio import Microphone, list_microphones
-from .realtime_api import RealtimeClient, State
+from .autosave import TranscriptAutosave
+from .live_client import LiveClient
+from .realtime_api import State
 
 
 def console(args):
-    client = RealtimeClient(
-        source_model=args.source_model,
-        event_log=args.raw_events,
-        source_mode=args.source_mode,
-        diarization_enabled=not args.no_diarization,
-    )
-    client.start(args.device, args.noise_reduction)
-    seen = 0
-    last_state = None
+    client = LiveClient()
+    autosave = TranscriptAutosave({"subtitles": client.history})
+    print(f"自動保存先: {autosave.directory}", flush=True)
+    cursor = 0
+    seen = set()
+    partial = None
     next_diagnostic = 0.0
+    client.start(args.device)
     started = time.monotonic()
-    try:
-        while client.active:
-            snapshot = client.snapshot()
-            notice = (snapshot["state"], snapshot["error"], snapshot.get("english_error", ""))
-            if notice != last_state:
-                print(f"[{snapshot['state']}] {snapshot['error']} {notice[2]}", flush=True)
-                last_state = notice
-            records = client.history.records(seen)
-            for record in records:
+
+    def print_updates():
+        nonlocal cursor, partial
+        updates, metadata = client.history.autosave_updates(cursor)
+        cursor += len(updates)
+        for record in updates:
+            sequence = record["sequence_id"]
+            if sequence not in seen:
                 print(
-                    f"{record['language'].upper()} [{record['elapsed_ms']} ms]: {record['delta']}",
+                    f"EN #{sequence} [{record['speaker']} "
+                    f"{record['start_ms']}–{record['end_ms']} ms]: {record['en_text']}",
                     flush=True,
                 )
-            seen += len(records)
-            if args.diagnostic and time.monotonic() >= next_diagnostic:
-                print(json.dumps(snapshot, ensure_ascii=False), flush=True)
-                next_diagnostic = time.monotonic() + 1
+                seen.add(sequence)
+            if record["translation_status"] == "completed":
+                print(f"JA #{sequence}: {record['ja_text']}", flush=True)
+        if metadata["en"] and metadata["en"] != partial:
+            print(f"EN partial (replacement): {metadata['en']}", flush=True)
+        partial = metadata["en"]
+
+    try:
+        while client.active:
+            print_updates()
+            if time.monotonic() >= next_diagnostic:
+                snapshot = client.snapshot()
+                print(
+                    json.dumps(
+                        snapshot
+                        if args.diagnostic
+                        else {
+                            "state": snapshot["state"],
+                            "error": snapshot["error"],
+                            "translation_error": snapshot["translation_error"],
+                            "autosave_error": autosave.error,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                next_diagnostic = time.monotonic() + 2
             if args.seconds and time.monotonic() - started >= args.seconds:
                 break
             time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:
-        failed = client.state == State.ERROR
         client.stop()
         client.join()
-        final_snapshot = client.snapshot()
-        failed = failed or bool(final_snapshot["error"] or final_snapshot.get("english_error"))
-        print(
-            f"[{final_snapshot['state']}] {final_snapshot['error']}",
-            file=sys.stderr if failed else sys.stdout,
-            flush=True,
-        )
-        if args.diagnostic:
-            print(json.dumps(final_snapshot, ensure_ascii=False), flush=True)
-        for record in client.history.records(seen):
-            print(f"{record['language'].upper()} [{record['elapsed_ms']} ms]: {record['delta']}")
+        print_updates()
+        saved = autosave.close()
+        print(json.dumps(client.snapshot(), ensure_ascii=False), flush=True)
+        if not saved:
+            print(autosave.error or "自動保存終了待機タイムアウト", file=sys.stderr)
         if args.save:
-            client.history.save(args.save)
-        client._diarization.close()
-    return 1 if failed else 0
+            client.history.save(args.save, overwrite=False)
+    return (
+        1
+        if client.state == State.ERROR or not saved or client.snapshot()["translation_error"]
+        else 0
+    )
 
 
 def main():
@@ -72,23 +91,7 @@ def main():
         "--probe-mic", action="store_true", help="Test microphone without API access"
     )
     parser.add_argument("--device", type=int, help="Input device index; default is OS input")
-    parser.add_argument(
-        "--noise-reduction", choices=["far_field", "near_field"], default="far_field"
-    )
     parser.add_argument("--diagnostic", action="store_true")
-    parser.add_argument(
-        "--no-diarization", action="store_true", help="Disable delayed speaker paragraphs"
-    )
-    parser.add_argument("--source-mode", choices=["separate", "sidecar"], default="separate")
-    parser.add_argument(
-        "--raw-events", help="Receive-boundary JSONL log (contains transcript text)"
-    )
-    parser.add_argument(
-        "--source-model",
-        choices=["gpt-live-transcribe", "gpt-realtime-whisper"],
-        default="gpt-live-transcribe",
-        help="Source transcription model inside translation session",
-    )
     parser.add_argument("--seconds", type=float, help="Stop console mode after this many seconds")
     parser.add_argument("--save", help="Save console transcript history as UTF-8 JSONL")
     args = parser.parse_args()
@@ -133,14 +136,7 @@ def main():
         return console(args)
     from .ui import run_gui
 
-    return run_gui(
-        client=RealtimeClient(
-            source_model=args.source_model,
-            event_log=args.raw_events,
-            source_mode=args.source_mode,
-            diarization_enabled=not args.no_diarization,
-        )
-    )
+    return run_gui(client=LiveClient())
 
 
 if __name__ == "__main__":

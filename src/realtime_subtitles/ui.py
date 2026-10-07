@@ -12,7 +12,9 @@ from pathlib import Path
 from tkinter import font, ttk
 
 from .audio import list_microphones
-from .realtime_api import RealtimeClient, State
+from .autosave import TranscriptAutosave
+from .live_client import LiveClient
+from .realtime_api import State
 from .settings import Settings
 from .subtitle_buffer import rolling_text
 
@@ -194,7 +196,13 @@ def wrap_subtitle(text, measure, width, max_lines=3):
 class SubtitleApp:
     def __init__(self, root, *, client=None, settings_file=None, device_loader=list_microphones):
         self.root = root
-        self.client = client if client is not None else RealtimeClient()
+        self.client = client if client is not None else LiveClient()
+        self.is_live = hasattr(self.client.history, "autosave_updates")
+        self.autosave = TranscriptAutosave(
+            {"subtitles" if self.is_live else "openai": self.client.history}
+        )
+        self._live_render_revision = -1
+        self._live_rendered = {"en": "", "ja": ""}
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
         self.device_loader = device_loader
@@ -214,7 +222,11 @@ class SubtitleApp:
         self._save_id = None
         self.diagnostic_window = None
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
-        root.title("Realtime Subtitles · EN → 日本語")
+        root.title(
+            "Realtime Subtitles · Speechmatics + Luna"
+            if self.is_live
+            else "Realtime Subtitles · EN → 日本語"
+        )
         root.configure(bg=BG)
         root.attributes("-alpha", 1 - self.settings.transparency / 100)
         root.attributes("-topmost", self.settings.always_on_top)
@@ -275,12 +287,15 @@ class SubtitleApp:
 
         options = ttk.Frame(self.settings_window, padding=(12, 0, 12, 7))
         options.pack(fill="x")
-        ttk.Label(options, text="Noise").pack(side="left")
+        noise_label = ttk.Label(options, text="Noise")
+        if not self.is_live:
+            noise_label.pack(side="left")
         self.noise = ttk.Combobox(
             options, values=["far_field", "near_field"], state="readonly", width=10
         )
         self.noise.set(self.settings.noise_reduction)
-        self.noise.pack(side="left", padx=(5, 14))
+        if not self.is_live:
+            self.noise.pack(side="left", padx=(5, 14))
         self.noise.bind("<<ComboboxSelected>>", lambda _: self._schedule_save())
         self.topmost = tk.BooleanVar(value=self.settings.always_on_top)
         ttk.Checkbutton(
@@ -339,9 +354,20 @@ class SubtitleApp:
         ttk.Label(details, text="字幕上でホイール：過去ログ ／ End：最新へ戻る").pack(anchor="w")
         ttk.Label(
             details,
-            text="話者交代を検出すると、字幕の対応位置に後から空行を追加します。",
+            text=(
+                "Speechmaticsで話者交代を検出すると、英語・日本語の両方に空行を入れます。"
+                if self.is_live
+                else "話者交代を検出すると、字幕の対応位置に後から空行を追加します。"
+            ),
             wraplength=650,
         ).pack(anchor="w", pady=(5, 0))
+        ttk.Label(details, text=f"自動保存先: {self.autosave.directory}", wraplength=500).pack(
+            fill="x"
+        )
+        if self.is_live:
+            ttk.Button(details, text="未翻訳を再試行", command=self.client.retry_translations).pack(
+                anchor="e"
+            )
         ttk.Button(details, text="Diagnostics", command=self.show_diagnostics).pack(anchor="e")
         status = ttk.Frame(self.root, padding=(12, 7, 12, 4))
         status.pack(fill="x")
@@ -477,6 +503,9 @@ class SubtitleApp:
         return "break"
 
     def _render_history(self):
+        if self.is_live:
+            self._render_live_history()
+            return
         epoch, cursor, records = self.client.history.display_records(self._history_cursor)
         if epoch != self._display_epoch:
             for language, widget in self.caption_widgets.items():
@@ -514,6 +543,63 @@ class SubtitleApp:
                 widget.yview(top)
         self._history_cursor = cursor
         self._render_speaker_breaks()
+
+    def _render_live_history(self):
+        revision, epoch, segments, partial, partial_break = self.client.history.display_snapshot()
+        if revision == self._live_render_revision:
+            for lang, widget in self.caption_widgets.items():
+                if self.follow_latest[lang]:
+                    widget.see("end-1c")
+            return
+        if epoch != self._display_epoch:
+            self.follow_latest = {"en": True, "ja": True}
+            self._display_epoch = epoch
+            self._update_follow_button()
+        for lang, widget in self.caption_widgets.items():
+            parts = []
+            for segment in segments:
+                if parts and segment.break_before:
+                    parts.append("\n\n")
+                if lang == "en":
+                    parts.append(segment.en_text)
+                elif segment.ja_text is not None:
+                    parts.append(segment.ja_text)
+                else:
+                    pending = segment.translation_status in {"pending", "translating"}
+                    parts.append("［翻訳待ち…］" if pending else "［未翻訳］")
+            base = "".join(parts)
+            suffix = ("\n\n" if base and partial_break else "") + partial if lang == "en" else ""
+            new = base + suffix
+            old = self._live_rendered[lang]
+            prefix = 0
+            for a, b in zip(old, new, strict=False):
+                if a != b:
+                    break
+                prefix += 1
+            tail = 0
+            while tail < min(len(old), len(new)) - prefix and old[-tail - 1] == new[-tail - 1]:
+                tail += 1
+
+            def index(text, count, widget=widget):
+                return f"1.0+{widget.tk.call('string', 'length', text[:count])}c"
+
+            widget.mark_set("live_view", "@0,0")
+            widget.mark_gravity("live_view", "right")
+            widget.configure(state="normal")
+            if old != new:
+                widget.delete(index(old, prefix), index(old, len(old) - tail))
+                widget.insert(index(new, prefix), new[prefix : len(new) - tail])
+            widget.tag_configure("partial", foreground="#858d99")
+            widget.tag_remove("partial", "1.0", "end")
+            if suffix:
+                widget.tag_add("partial", index(new, len(base)), "end-1c")
+            widget.configure(state="disabled")
+            if self.follow_latest[lang]:
+                widget.see("end-1c")
+            else:
+                widget.yview("live_view")
+            self._live_rendered[lang] = new
+        self._live_render_revision = revision
 
     def _render_speaker_breaks(self):
         revision, boundaries = self.client.history.speaker_boundaries.snapshot()
@@ -761,7 +847,14 @@ class SubtitleApp:
         english_state = snapshot.get("english_connection")
         if snapshot["state"] == State.RUNNING and english_state not in {None, "RUNNING"}:
             self.status_var.set(f"RUNNING / EN {english_state}")
-        self.error_var.set(snapshot["error"] or snapshot.get("english_error") or self.local_error)
+        snapshot["autosave"] = self.autosave.snapshot()
+        self.error_var.set(
+            self.autosave.error
+            or snapshot.get("translation_error")
+            or snapshot["error"]
+            or snapshot.get("english_error")
+            or self.local_error
+        )
         self.error_label.configure(wraplength=max(100, self.root.winfo_width() - 24))
         busy = self.client.active or self.refreshing or self.closing
         self.start_button.configure(state="disabled" if busy else "normal")
@@ -777,7 +870,15 @@ class SubtitleApp:
         self.level.configure(value=max(0, min(60, dbfs + 60)))
         self.level_text.set(f"Mic: {dbfs:.0f} dBFS")
         delayed = snapshot.get("source_delayed") and self.client.state == State.RUNNING
-        self.transcript_status.set("英語の受信待ち（日本語は受信中）" if delayed else "")
+        if self.is_live:
+            counts = snapshot.get("translation_status", {})
+            pending = counts.get("pending", 0) + counts.get("translating", 0)
+            missing = sum(counts.get(k, 0) for k in ("failed", "skipped", "cancelled"))
+            self.transcript_status.set(
+                f"翻訳待ち {pending} / 未翻訳 {missing}" if pending or missing else ""
+            )
+        else:
+            self.transcript_status.set("英語の受信待ち（日本語は受信中）" if delayed else "")
 
         self._render_history()
         if self.diagnostic_window and self.diagnostic_window.winfo_exists():
@@ -789,6 +890,10 @@ class SubtitleApp:
                 self.diagnostic_text.configure(state="disabled")
                 self._last_diagnostic = diagnostic
         if self.closing and not self.client.active and not self.saving:
+            self.autosave.request_close()
+            if self.autosave.active:
+                self._poll_id = self.root.after(50, self._poll)
+                return
             self.root.destroy()
             return
         self._poll_id = self.root.after(50, self._poll)
@@ -801,7 +906,8 @@ class SubtitleApp:
             self._save_id = None
         self._save_settings()
         self.closing = True
-        self.client._diarization.close()
+        if not self.is_live:
+            self.client._diarization.close()
         self.client.stop()
 
 
