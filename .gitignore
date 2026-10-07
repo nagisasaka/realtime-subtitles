@@ -61,3 +61,7 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# External benchmark corpora and generated results
+/testdata/external/
+/benchmark_results/

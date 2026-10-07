@@ -1,0 +1,5 @@
+extend = "../../pyproject.toml"
+extend-exclude = ["vendor"]
+
+[lint.per-file-ignores]
+"report.py" = ["E501"] # Japanese Markdown templates and table rows

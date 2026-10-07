@@ -1,0 +1,5 @@
+# App dependencies (speechmatics-agent-stt, numpy, soxr) come from pip install -e .
+# Scoring on WSL/Linux; MeetEval builds a small C++ extension (no ASR models).
+meeteval==0.4.3
+regex==2026.9.29
+more-itertools==11.1.0

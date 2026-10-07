@@ -1,0 +1,8 @@
+{
+  "__init__.py": "469491d42def47eac8fd25e67022ae404bc538a180d9d26a29e5f40bd5e95f27",
+  "basic.py": "8d9018530764391d062e0575e8a6b0db35e87168044467dcaf117c350a2cab1e",
+  "english.py": "fc7e6eabb7b5ba902cfe8a550b61d524d59e4f173f3769ad233317ef8d625fa6",
+  "english.json": "8b39e93a0cbdbd67fb8a5dbf7a7e4b6ba3bb137d2163977d6ff752b4d7259fc7",
+  "pre_english.json": "7654fdd26f76e2e0804b3cbed0dbce72e03102af2db1913193bead044c6ec42a",
+  "LICENSE": "b5d65a59060e68c4ff940e1eddfa6f94b2d68fdf58ed7f4dd57721c997e35e9d"
+}
