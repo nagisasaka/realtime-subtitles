@@ -14,6 +14,7 @@ dependencies = [
   "soxr>=0.5,<2",
   "websockets>=15,<18",
   "speechmatics-rt>=1.2.1,<2",
+  "speechmatics-agent-stt>=0.2,<0.3",
   "openai>=2,<3",
 ]
 

@@ -197,6 +197,10 @@ class SegmentHistory:
 class SpeechmaticsClient:
     """One SDK/WebSocket on its own thread. Capture only enqueues immutable PCM."""
 
+    events = EVENTS
+    model = "enhanced"
+    output_rate = OUTPUT_RATE
+
     def __init__(
         self, *, endpoint=ENDPOINT, on_event=None, on_session=None, max_delay=4.0, retry_base=5.0
     ):
@@ -207,7 +211,7 @@ class SpeechmaticsClient:
         self.frames = LatestQueue(5)
         self.state, self.error, self.warning = "STOPPED", "", ""
         self.sent_frames = self.acknowledged = 0
-        self.event_counts = dict.fromkeys(EVENTS, 0)
+        self.event_counts = dict.fromkeys(self.events, 0)
         self.session_id = None
         self.stop_requested = threading.Event()
         self.thread = None
@@ -260,7 +264,8 @@ class SpeechmaticsClient:
             "warning": self.warning,
             "session_id": self.session_id,
             "endpoint": self.endpoint,
-            "model": "enhanced",
+            "model": self.model,
+            "output_rate": self.output_rate,
             "max_delay": self.max_delay,
             "queue": self.frames.qsize(),
             "dropped_frames": self.frames.dropped,
@@ -285,13 +290,6 @@ class SpeechmaticsClient:
                 self.state = "STOPPED"
 
     async def _run(self, key):
-        from speechmatics.rt import (
-            AsyncClient,
-            AudioEncoding,
-            AudioFormat,
-            TranscriptionConfig,
-        )
-
         # SDK errors may include server-provided reasons. Surface safe types via our status.
         for name in (
             "speechmatics.rt",
@@ -305,7 +303,7 @@ class SpeechmaticsClient:
             if self.stop_requested.is_set():
                 return
             server_error, ended = [], []
-            client = AsyncClient(api_key=key, url=self.endpoint)
+            client = self._new_sdk(key)
             self.sent_frames = self.acknowledged = 0
             self.session_ready = False
 
@@ -322,34 +320,21 @@ class SpeechmaticsClient:
                     ended.append(True)
                 elif kind == "AudioAdded":
                     self.acknowledged = event.get("seq_no", self.acknowledged)
-                elif kind in EVENTS:
+                elif kind in self.events:
                     self.event_counts[kind] += 1
                     try:
-                        segments = self.history.accept(event, self.session_id)
+                        segments = self._accept(event)
                     except (ValueError, TypeError, AttributeError, KeyError):
                         self.warning = "Malformed subtitle event"
                         return
                     if self.on_event:
                         self.on_event(event, segments)
 
-            for kind in (*EVENTS, "Error", "Warning", "AudioAdded", "EndOfTranscript"):
+            for kind in (*self.events, "Error", "Warning", "AudioAdded", "EndOfTranscript"):
                 client.on(kind, receive)
             try:
                 async with asyncio.timeout(15):
-                    await client.start_session(
-                        transcription_config=TranscriptionConfig(
-                            model="enhanced",
-                            language="en",
-                            enable_partials=True,
-                            diarization="speaker",
-                            max_delay=self.max_delay,
-                        ),
-                        audio_format=AudioFormat(
-                            encoding=AudioEncoding.PCM_S16LE,
-                            sample_rate=OUTPUT_RATE,
-                            chunk_size=FRAME_BYTES,
-                        ),
-                    )
+                    await self._connect_sdk(client)
                 self.session_id = client.session_id
                 self.history.begin_session(self.session_id)
                 if self.on_session:
@@ -367,11 +352,12 @@ class SpeechmaticsClient:
                     if time.monotonic() - captured > 1:
                         self.frames.dropped += 1
                         continue
-                    async with asyncio.timeout(3):
-                        while self.sent_frames - self.acknowledged >= 10:
-                            await asyncio.sleep(0.01)
-                        await client.send_audio(frame)
-                    self.sent_frames += 1
+                    payload = self._encode_audio(frame)
+                    if payload:
+                        await self._send_audio(client, payload)
+                tail = self._flush_audio()
+                if tail:
+                    await self._send_audio(client, tail)
                 # Bounded graceful shutdown returns pending English finals before closing.
                 async with asyncio.timeout(8):
                     # SDK 1.2.1 overwrites its send counter when AudioAdded arrives.
@@ -419,3 +405,42 @@ class SpeechmaticsClient:
             until = time.monotonic() + min(30, self.retry_base * 2**attempt)
             while not self.stop_requested.is_set() and time.monotonic() < until:
                 await asyncio.sleep(0.05)
+
+    def _new_sdk(self, key):
+        from speechmatics.rt import AsyncClient
+
+        return AsyncClient(api_key=key, url=self.endpoint)
+
+    async def _connect_sdk(self, client):
+        from speechmatics.rt import AudioEncoding, AudioFormat, TranscriptionConfig
+
+        await client.start_session(
+            transcription_config=TranscriptionConfig(
+                model="enhanced",
+                language="en",
+                enable_partials=True,
+                diarization="speaker",
+                max_delay=self.max_delay,
+            ),
+            audio_format=AudioFormat(
+                encoding=AudioEncoding.PCM_S16LE,
+                sample_rate=OUTPUT_RATE,
+                chunk_size=FRAME_BYTES,
+            ),
+        )
+
+    def _accept(self, event):
+        return self.history.accept(event, self.session_id)
+
+    def _encode_audio(self, frame):
+        return frame
+
+    def _flush_audio(self):
+        return b""
+
+    async def _send_audio(self, client, payload):
+        async with asyncio.timeout(3):
+            while self.sent_frames - self.acknowledged >= 10:
+                await asyncio.sleep(0.01)
+            await client.send_audio(payload)
+        self.sent_frames += 1

@@ -223,7 +223,7 @@ class SubtitleApp:
         self.diagnostic_window = None
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
         root.title(
-            "Realtime Subtitles · Speechmatics + Luna"
+            "Realtime Subtitles · Speechmatics Agent STT + Luna"
             if self.is_live
             else "Realtime Subtitles · EN → 日本語"
         )
@@ -558,8 +558,8 @@ class SubtitleApp:
         for lang, widget in self.caption_widgets.items():
             parts = []
             for segment in segments:
-                if parts and segment.break_before:
-                    parts.append("\n\n")
+                if parts:
+                    parts.append("\n\n" if segment.break_before else " ")
                 if lang == "en":
                     parts.append(segment.en_text)
                 elif segment.ja_text is not None:
@@ -568,7 +568,11 @@ class SubtitleApp:
                     pending = segment.translation_status in {"pending", "translating"}
                     parts.append("［翻訳待ち…］" if pending else "［未翻訳］")
             base = "".join(parts)
-            suffix = ("\n\n" if base and partial_break else "") + partial if lang == "en" else ""
+            suffix = (
+                ("\n\n" if base and partial_break else " " if base else "") + partial
+                if lang == "en" and partial
+                else ""
+            )
             new = base + suffix
             old = self._live_rendered[lang]
             prefix = 0
@@ -850,6 +854,7 @@ class SubtitleApp:
         snapshot["autosave"] = self.autosave.snapshot()
         self.error_var.set(
             self.autosave.error
+            or snapshot.get("recording", {}).get("error")
             or snapshot.get("translation_error")
             or snapshot["error"]
             or snapshot.get("english_error")

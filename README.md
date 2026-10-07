@@ -1,17 +1,18 @@
 # Realtime Subtitles — Speechmatics + OpenAI Luna
 
 Windows 11のマイクから英語を取得し、英語字幕と日本語翻訳字幕を軽量なtkinterオーバーレイで表示します。
-**mainの標準構成はSpeechmatics Realtime STT＋話者分離 → OpenAI Text Translationです。**
+**mainの標準構成はSpeechmatics Agent STT＋話者分離 → OpenAI Text Translationです。**
 
 ```text
 Windows microphone (sounddevice、1デバイスのみ)
   → native float32 → mono / 24 kHz PCM16 / 200 ms
-  → Speechmatics Realtime Enhanced (en / partials / speaker diarization)
+  → 16 kHzへ送信workerで変換（24 kHz PCMは別workerでWAV保存）
+  → Speechmatics Agent STT linden-1 (en / partials / speaker / emit_sentences)
       ├─ Partial EN → 現在の未確定部分を置換表示
-      └─ Final EN → sequence_id / speaker / start_ms / end_ms
+      └─ AddSegment → TranslationUnit / sequence_id / speaker / start_ms / end_ms
                       → bounded queue → OpenAI Responses API × 最大4並列
                           gpt-6-luna / reasoning.effort=none
-                      → 同じfinalのJA欄へ追加
+                      → 同じTranslationUnitのJA欄へ追加
 ```
 
 Speechmatics Translationは設定・使用しません。OpenAI Realtime Translation、別のRealtime英語接続、
@@ -19,7 +20,7 @@ Speechmatics Translationは設定・使用しません。OpenAI Realtime Transla
 
 ## Gitの復元ポイント
 
-- `main`: 現在のSpeechmatics STT + Luna翻訳版。
+- `main`: 現在のSpeechmatics Agent STT + Luna翻訳版。
 - `openai-stable-v1`: 元のOpenAI Realtime安定版、`1e95fe5b433c846a1534d25301060b17416e8930`。変更・削除しません。
 - `experiment/speechmatics`: 比較版＋自動保存の記録、`e20f0b3`。このbranchも保持します。
 
@@ -45,8 +46,8 @@ py -3 -m venv .venv-win
 .\.venv-win\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-主な依存関係はsounddevice、numpy、soxr、speechmatics-rt、OpenAI公式Python SDKです。
-実装時確認バージョン: `speechmatics-rt 1.2.1`、`openai 2.54.0`。
+主な依存関係はsounddevice、numpy、soxr、speechmatics-agent-stt、speechmatics-rt、OpenAI公式Python SDKです。
+実装時確認バージョン: `speechmatics-agent-stt 0.2.0`、`speechmatics-rt 1.2.1`、`openai 2.54.0`。
 `tkinter`はpipで入れるライブラリではありません。PythonインストーラーのTcl/Tkを有効にしてください。
 
 ## APIキーと起動
@@ -103,11 +104,16 @@ Diagnosticsには入力デバイス、native rate、PCM形式、queue、Speechma
 
 ## 翻訳単位・文脈・話者
 
-**AddTranscript 1イベント = FinalSegment 1件 = 翻訳TARGET 1件**です。
-句読点で再分割・連結したり、sentence bufferを作ったり、ピリオドを待ったりしません。
-複数文が含まれるfinalも、文の途中で終わるfinalも、そのままTARGETにします。
+**AddSegment 1イベント = TranslationUnit 1件 = 翻訳TARGET 1件**です。
+`segment.transcript`全体をそのまま翻訳し、`segment.speaker`と`metadata.start_time/end_time`を保持します。
+`AddPartialSegment`は前のpartialを置換する英語ライブ表示専用です。
+`AddTranscript` / word / 低レベルfinalは翻訳のトリガーにしません。
+サーバーの`emit_sentences=true`で文境界を含むsegmentを受信し、クライアント独自の文分割・結合は行いません。
+非推奨Realtime Voice SDKは使わず、`speechmatics-agent-stt`を使用します。
 
-直前最大5件の確定英語finalを、speakerとともにCONTEXTへ渡します。今回のTARGETや日本語訳はCONTEXTに含めません。
+直前最大5件のTranslationUnitの確定英語とspeakerをCONTEXTへ渡します。
+word metadataは別の履歴であり、context件数にもJA履歴にも数えません。
+今回のTARGETや以前の日本語訳はCONTEXTに含めません。
 認識sessionをまたぐ文脈は混ぜません。固有名詞、数値、否定、比較、金額、単位、技術用語を維持し、
 CONTEXTを再翻訳せずTARGETだけ自然な日本語へ訳すよう指示しています。
 `frontier API`、`raw tokens per second`、`open-source model`、`guardrails`、`on-demand scaling`などにも配慮します。
@@ -117,15 +123,17 @@ CONTEXTを再翻訳せずTARGETだけ自然な日本語へ訳すよう指示し�
 前の翻訳が遅くても、後の翻訳をその位置へ表示し、前の欄は届いた時点で更新します。
 EN/JAは同じfinalのspeaker・timestampを共有するので、時刻や文字列の類似度でalignmentを推測する必要はありません。
 
-前final末尾の既知speakerと次final冒頭のspeakerが変わると `break_before=true` にし、EN/JAに同じ空行を入れます。
-未知speaker（UU/SUなど）だけで話者交代を推定しません。speaker IDは接続をまたぐ人物IDではありません。
-1つのfinal内に複数speakerが含まれる場合も翻訳単位は分割しません。word単位のspeaker/timeは保存しますが、
-そのfinal内のJAへ話者改行を推測で入れることはありません。session切り替わりも空行で区切ります。
+前のTranslationUnitと次のTranslationUnitの既知speakerが変わると`break_before=true`にし、
+EN/JAに同じ空行を入れます。未知speaker（UU/SUなど）だけで話者交代を推定しません。
+speaker IDは接続をまたぐ人物IDではありません。session切り替わりも空行で区切ります。
+Agent STTのspeaker判定自体が誤る場合もあり、人物ごとの恒久IDや固定色は実装していません。
 
 ## スレッド・待ち行列・障害時
 
 音声取得callback、リサンプリング、Speechmatics接続、OpenAI翻訳、保存はバックグラウンドで動作します。
-GUI更新はTk main threadの`after`だけです。マイクは1つだけ開き、24kHz mono PCM16を無音中も200ms単位で継続送信します。
+GUI更新はTk main threadの`after`だけです。マイクは1つだけ開き、24kHz mono PCM16を200ms単位で生成します。
+同じPCMを録音へfan-outし、Agent STTの送信workerで16kHzへ連続リサンプリングします。
+無音中も送信し、クライアント側VADによる送信停止は行いません。
 音声queueは既存のbounded / 古いframe破棄方式です。Speechmatics再接続中の古い音声は貯めません。
 
 - Speechmaticsのみ独立してbounded exponential backoffで再接続。再接続時もマイクを開き直しません。
@@ -141,12 +149,13 @@ GUI更新はTk main threadの`after`だけです。マイクは1つだけ開き�
 
 | ファイル | 定数 | 初期値 |
 | --- | --- | --- |
-| `final_history.py` | `TRANSLATION_CONTEXT_SEGMENTS` | 5 |
+| `translation_history.py` | `TRANSLATION_CONTEXT_SEGMENTS` | 5 |
 | `text_translation.py` | `MODEL` | gpt-6-luna |
 | `text_translation.py` | `TRANSLATION_CONCURRENCY` | 4 |
 | `text_translation.py` | `TRANSLATION_QUEUE_SIZE` | 48 |
 | `text_translation.py` | `REQUEST_TIMEOUT_SEC` / `STOP_DRAIN_SEC` | 20 / 5秒 |
-| `speechmatics_api.py` | `max_delay` | 4秒（enhanced品質優先） |
+| `agent_stt.py` | `AGENT_RATE` / `emit_sentences` | 16000 Hz / true |
+| `audio_recording.py` | `ROTATE_SECONDS` | 1800秒（30分） |
 
 ## 自動保存・通信先
 
@@ -154,12 +163,13 @@ Saveを押さなくても、GUI・consoleの認識・翻訳結果を自動保存
 
 ```text
 %USERPROFILE%\RealtimeSubtitles\Autosave\起動日時-ID\
-    subtitles.jsonl   # final作成・翻訳状態・JA結果の追記journal
+    subtitles.jsonl   # TranslationUnit作成・翻訳状態・JA結果の追記journal
     subtitles.txt     # sequence順のEN/JA対訳、時刻、話者改行
 ```
 
 JSONLは約0.5秒ごとに追記してflush/fsync、TXTは約5秒ごとに一時ファイルから置換します。正常終了時も最終保存します。
-JSONLの `kind="transcript"` 内の `record` がFinalSegmentのsnapshotです。
+JSONLの `kind="transcript"` 内の `record.kind="translation_unit"` がTranslationUnitのsnapshotです。
+`record.kind="raw_word_metadata"`は受信した場合のみ保存する別種のmetadataです。翻訳済み字幕として集計しないでください。
 同じsequence_idの後続recordは翻訳状態・結果の更新なので、復元時は**各sequence_idの最後のrecord**を採用してください。
 元のENは更新で置換しません。`partial_snapshot`は未確定英語で、確定全文へ足し合わせません。
 start_ms / end_msはSpeechmatics session内の音声時刻、received_monotonic_msは到着時刻です。別の時刻として保存します。
@@ -169,13 +179,31 @@ Stop/Startでも同じ起動内は同じフォルダーを使います。過去�
 強制終了・電源断では未保存の直近分が失われる可能性があります。JSONLの末尾が途中で切れた場合は最後の不完全な行を無視してください。
 自動削除、保存容量上限、再起動時のGUIへの履歴復元は未実装です。
 
-**マイク音声・一時WAVは保存しません。** mainでは後追いdiarizationの30秒ring bufferも作りません。
+**Startするとマイク音声も自動保存し、Stopで録音を終了します。**
+
+```text
+%USERPROFILE%\RealtimeSubtitles\Recordings\開始日時-ID\
+    audio-0000.wav    # 24kHz / mono / signed PCM16 little endian
+    audio-0001.wav    # 30分ごとに次のファイルへ
+    gaps.jsonl        # 書き込み遅延による欠落がある場合のsample範囲
+```
+
+録音はStartごとに新規フォルダーを作り、既存のファイルを上書きしません。
+約173 MB/時（10進表記）です。無音や再接続中の入力も記録します。
+録音workerは最大20秒分のqueueを持ち、満杯なら字幕を優先して録音frameを破棄します。
+その位置を無音で埋め、`gaps.jsonl`に記録して録音時間の圧縮を避けます。
+音声変換より前のデバイスoverflowやcapture自体の欠落は、この録音queueのgapには含まれません。
+WAVヘッダーはchunkごとに更新、約1秒ごとにflush/fsync、Stopでcloseします。
+強制終了時の直近データ保存は保証しません。録音エラーはUI・Diagnosticsに表示し、字幕処理は継続します。
+録音エラー後の自動復旧はせず、次回Startで新しい録音を開始します。
+自動削除や容量上限はありません。不要な録音は手動で削除してください。
+mainでは後追いdiarizationの30秒ring bufferは作りません。
 字幕はローカルの平文ファイルです。キーやAuthorization headerは保存しません。
 
 | 接続先 | データ・タイミング |
 | --- | --- |
-| `wss://global.rt.speechmatics.com/v2/` | Start時にSTT接続。24kHz PCMを200msごと、無音も送信。Stopで終了 |
-| `https://api.openai.com/v1/responses` | final受信ごとにTARGET＋直前最大5 finalの英語を送信。`store=false`、最大4並列 |
+| `wss://global.rt.speechmatics.com/v2/agent` | Start時にAgent STT接続。16kHz PCMを継続送信、Stopで終了 |
+| `https://api.openai.com/v1/responses` | AddSegment受信ごとにTARGET＋直前最大5 TranslationUnitの英語を送信。`store=false`、最大4並列 |
 
 SpeechmaticsのTranslation bolt-onは使用しません。課金はSpeechmatics STTの接続音声時間と、
 Lunaの実際の入力（prompt/context含む）・出力tokensに依存するため、固定の1時間額ではありません。
@@ -205,20 +233,25 @@ OpenAI公式SDKのMockTransportテストを含みます。Windows GUIテスト�
 マイク変換、partial置換、final翻訳トリガー、文脈5件、話者改行、並列順序、queue上限、失敗分離、
 Stop/Start・再接続・EOS final、自動保存の更新、スクロール位置を検証します。
 
-## 実測確認（2026-10-07）
+## Enhanced Realtime → Agent STT移行とA/B比較
 
-- WSL: **59 passed / 5 skipped**、Windows Python: **64 passed**。Ruff lint / format、依存関係の整合性チェックも成功。
-- Windows default microphone: Microphone Array on SoundWire D、native 44.1kHz mono float32 → 24kHz mono PCM16。
-- WindowsオーバーレイでEN partial / final、LunaのJA、自動保存を実APIで確認。
-- `gpt-6-luna` / `reasoning.effort=none` の実レスポンスで reasoning tokens=0を確認。
-  数値（12,500 tokens/s）、金額（$0.25 / million tokens）、技術用語を含むTARGETの翻訳、およびCONTEXTを繰り返さない短いTARGETの例も確認。
-- 3並列では細かいfinalが続く際にqueueが増えたため、既定を4並列へ調整。
-  調整後の連続実行では少なくとも486 final中481件翻訳済み、残り5件処理待ち／中、同session内のqueue overflow=0を確認。
-  その区間のrequest処理時間中央値は約1.3秒（ASR確定待ち・queue待ちは含みません）。発話内容・通信によって変わります。
-- 実機Stop → Startを確認。Stop後はマイク・接続・翻訳workerが終了し、再開後も同じ履歴へ追記。
-- PyInstaller onedirビルド成功。生成exeの `--list-devices` が終了コード0で完了。
+2026-10-07に旧経路のraw `AddTranscript`を31件採取し、31件の内部FinalSegmentと
+`metadata.transcript`がすべて一致することを確認しました。wordごとの分割バグではなく、
+サーバーの低レベルfinal自体が1〜2語になるため、翻訳単位をAgent STTのsegmentへ変更しています。
+`final_history.py`は旧経路の監査テスト用、`speechmatics_api.py`のEnhanced接続はA/B比較用に残します。
+通常UI・consoleから低レベルfinalを翻訳する経路はありません。
 
-品質評価用の正解付きWER/BLEU等は測定していません。特に短いfinalを日本語として自然につなぐ点には以下の制約があります。
+同じ録音を実時間で両方へ送る比較コマンド（マイクは開かず、LLM翻訳もしません）:
+
+```powershell
+.\.venv-win\Scripts\python.exe scripts\compare-agent-stt.py C:\path\audio-0000.wav --output diagnostics\ab-run-1
+```
+
+入力は24kHz mono PCM16 WAV。出力先は新規フォルダーを指定します。
+raw JSON、両方の英語全文、音源SHA256、final件数・語数・遅延・drop数を保存します。
+比較用のEnhancedはmodel=enhanced / max_delay=4秒、Agentはlinden-1 / emit_sentences=trueです。
+正解の書き起こしがない場合、両出力の一致率を認識精度やWERと呼ぶことはできません。
+テスト・実測結果は[移行検証記録](docs/agent-stt-validation.md)を参照してください。
 
 ## Troubleshooting / limitations
 
@@ -227,9 +260,9 @@ Stop/Start・再接続・EOS final、自動保存の更新、スクロール位�
 - 認証エラー: Windowsユーザー環境変数を設定してから上記の読込コマンドで新しいプロセスを起動。キーの値はログに貼らないでください。
 - 英語は出るが日本語が出ない: `translation_error`、API利用枠、モデルアクセス、通信を確認。Start中に未翻訳を再試行。
 - 日本語はfinal確定＋LLM requestの時間だけ遅れます。英語partialと同時には出ません。
-- 実機ではSpeechmatics finalが1〜数語になることも確認しています。短い断片だと自然な日本語として完結せず、連結した日本語にも不自然さが残る場合があります。mainでは独自の文結合・ピリオド待ちはしません。
+- Agent STTは文末、話者交代、turn終了などでsegmentを確定します。サーバーが長く確定しない場合、日本語もその分遅れます。文の途中でturnが切れた場合は短いsegmentになり得ます。
 - 小音量・遠い雑談・重なった発話ではASR誤認識と誤訳が起こり得ます。認識原文をLLMで訂正する機能は入れていません。
-- 同時発話、未知speaker、複数speakerを含むfinalでは段落分離に限界があります。
+- 同時発話、未知speaker、誤ったspeaker attributionでは段落分離に限界があります。
 - 保存できない: ディスク空き容量・保存先の権限を確認。保存失敗中の終了は最終書き出しを待ちます。
 
 ## Windows exe化
@@ -246,6 +279,10 @@ APIキーはexeへ埋め込みません。配布先でも環境変数を設定�
 Windows App Control等で未署名exeがブロックされる環境では、許可されたPythonから起動してください。
 
 ## 参照した公式仕様
+
+- [Speechmatics Agent STT SDK](https://docs.speechmatics.com/speech-to-text/agent-stt/quickstart)
+- [Agent STT segmentation](https://docs.speechmatics.com/speech-to-text/agent-stt/segmentation)
+- [Agent STT API reference](https://docs.speechmatics.com/api-ref/agent-stt-websocket)
 
 - [Speechmatics Realtime quickstart / Python SDK](https://docs.speechmatics.com/speech-to-text/realtime/quickstart)
 - [Speechmatics Realtime event schema](https://docs.speechmatics.com/api-ref/realtime-transcription-websocket)

@@ -25,6 +25,8 @@ def console(args):
         updates, metadata = client.history.autosave_updates(cursor)
         cursor += len(updates)
         for record in updates:
+            if record.get("kind") != "translation_unit":
+                continue  # Raw word metadata is never subtitle text or a translation trigger.
             sequence = record["sequence_id"]
             if sequence not in seen:
                 print(
@@ -53,6 +55,7 @@ def console(args):
                             "error": snapshot["error"],
                             "translation_error": snapshot["translation_error"],
                             "autosave_error": autosave.error,
+                            "recording_error": snapshot.get("recording", {}).get("error", ""),
                         },
                         ensure_ascii=False,
                     ),

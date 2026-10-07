@@ -12,3 +12,10 @@ def isolated_autosave_directory(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "realtime_subtitles.autosave.default_directory", lambda: tmp_path / "autosave"
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_audio_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "realtime_subtitles.audio_recording.default_directory", lambda: tmp_path / "recordings"
+    )

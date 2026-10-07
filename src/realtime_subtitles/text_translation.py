@@ -14,16 +14,12 @@ STOP_DRAIN_SEC = 5
 MAX_ATTEMPTS = 2
 INSTRUCTIONS = """You are a high-quality live conference subtitle translator.
 Translate English into natural, concise Japanese suitable for live subtitles.
-Input is JSON with CONTEXT (earlier English finals) and TARGET (the current final).
+Input is JSON with CONTEXT (earlier English segments) and TARGET (one finalized segment).
 Translate only TARGET.text. Never translate, summarize, repeat, or continue CONTEXT.
 Use CONTEXT only to resolve terminology, pronouns, references, topic, and speaker continuity.
 TARGET can be an incomplete sentence: translate the supplied fragment faithfully;
 do not wait for, infer, or invent its continuation.
-For a one-word or short fragment TARGET, output only that fragment's translation.
-Do not reconstruct a full sentence or repeat previous words/names from CONTEXT.
-Examples of strict scope: CONTEXT ends with "NCP", TARGET "service" -> "サービス";
-CONTEXT ends with "the demo", TARGET "app" -> "アプリ";
-TARGET "And" -> "そして". Context disambiguates meaning, not output scope.
+Translate the whole TARGET as one coherent subtitle, not as separate word fragments.
 Preserve factual meaning, negation, uncertainty, comparisons, numbers, monetary amounts,
 units, company/product/person names, technical terminology, and acronyms exactly.
 Do not invent information. Prefer natural Japanese over word-for-word translation.

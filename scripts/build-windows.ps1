@@ -12,6 +12,7 @@ $ui = if ($Console) { "--console" } else { "--windowed" }
 $appName = if ($Console) { "RealtimeSubtitlesConsole" } else { "RealtimeSubtitles" }
 & $python -m PyInstaller --noconfirm --clean $mode $ui --name $appName `
     --paths src --collect-all soxr --copy-metadata openai --copy-metadata speechmatics-rt `
+    --copy-metadata speechmatics-agent-stt `
     --exclude-module pytest --exclude-module ruff --exclude-module numpy.tests `
     --specpath build scripts\entrypoint.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -5,11 +5,12 @@ import queue
 import threading
 import time
 
+from .agent_stt import AgentSttClient
 from .audio import Microphone
-from .final_history import FinalHistory
+from .audio_recording import AudioRecorder
 from .realtime_api import State
-from .speechmatics_api import SpeechmaticsClient
 from .text_translation import TranslationWorker
+from .translation_history import TranslationHistory
 
 
 class LiveClient:
@@ -17,11 +18,15 @@ class LiveClient:
         self,
         *,
         microphone_factory=Microphone,
-        speechmatics_factory=SpeechmaticsClient,
+        speechmatics_factory=AgentSttClient,
         translation_factory=TranslationWorker,
         history=None,
+        recorder_factory=AudioRecorder,
     ):
-        self.history = history if history is not None else FinalHistory()
+        self.history = history if history is not None else TranslationHistory()
+        self.recorder_factory = recorder_factory
+        self.recorder = None
+        self.recording_error = ""
         self.microphone_factory = microphone_factory
         self.speechmatics_factory = speechmatics_factory
         self.translation_factory = translation_factory
@@ -58,19 +63,18 @@ class LiveClient:
 
     def _receive(self, event, words):
         sm = self.speechmatics
-        if event.get("message") == "AddPartialTranscript":
-            _, _, partials = sm.history.snapshot()
-            pending = partials["en"]
-            speaker = next(
-                (w.speaker for w in pending if w.speaker not in {None, "", "UU", "SU"}), None
-            )
-            self.history.set_partial("".join(w.text for w in pending), speaker)
+        if event.get("message") == "AddPartialSegment":
+            segment = event.get("segment") or {}
+            text = segment.get("transcript")
+            if isinstance(text, str):
+                self.history.set_partial(text, segment.get("speaker"))
+        elif event.get("message") == "AddSegment":
+            unit = self.history.add_segment(event, sm.session_id)
+            if unit is not None:
+                self.history.set_partial("")
+                self.translation.submit(unit)
         elif event.get("message") == "AddTranscript":
-            segment = self.history.add_final(event, sm.session_id)
-            _, _, partials = sm.history.snapshot()
-            self.history.set_partial("".join(w.text for w in partials["en"]))
-            if segment is not None:
-                self.translation.submit(segment)
+            self.history.record_word_metadata(event, sm.session_id)
 
     def stop(self):
         self.stop_requested.set()
@@ -96,6 +100,8 @@ class LiveClient:
 
     def _run(self, device):
         self.mic = None
+        self.recorder = None
+        self.recording_error = ""
         self.translation = self.speechmatics = None
         failed = False
         try:
@@ -115,6 +121,12 @@ class LiveClient:
                 self.stop_requested.wait(0.02)
             if self.stop_requested.is_set():
                 return
+            if self.recorder_factory:
+                try:
+                    self.recorder = self.recorder_factory()
+                    self.mic.frames.sinks = (*self.mic.frames.sinks, self.recorder)
+                except Exception as exc:
+                    self.recording_error = type(exc).__name__
             self.mic.start()
             while not self.stop_requested.is_set():
                 self.mic.check_health()
@@ -148,6 +160,11 @@ class LiveClient:
                     time.sleep(0.02)
                 self.speechmatics.stop()
                 self.speechmatics.join()
+            if self.recorder:
+                try:
+                    self.recorder.close()
+                except Exception as exc:
+                    self.recording_error = type(exc).__name__
             # EOS may emit additional finals; only now stop accepting translation jobs.
             if self.translation:
                 self.translation.finish()
@@ -171,7 +188,7 @@ class LiveClient:
         sm = self.speechmatics.snapshot() if self.speechmatics else {}
         counts = self.history.statistics()
         return {
-            "backend": "speechmatics-stt + openai-text",
+            "backend": "speechmatics-agent-stt + openai-text",
             "state": self.state.value,
             "error": self.error or sm.get("error", ""),
             "translation_error": self.translation.error if self.translation else "",
@@ -182,5 +199,10 @@ class LiveClient:
             "translation_queue": self.translation.jobs.qsize() if self.translation else 0,
             "translations_in_flight": self.translation.in_flight if self.translation else 0,
             "frames_dispatched": self.frames_dispatched,
+            "recording": (
+                {**self.recorder.snapshot(), "error": self.recording_error or self.recorder.error}
+                if self.recorder
+                else {"error": self.recording_error}
+            ),
             **(self.mic.diagnostics() if self.mic else {}),
         }
