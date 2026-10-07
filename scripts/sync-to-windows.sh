@@ -8,6 +8,7 @@ rsync -a --exclude='.venv/' --exclude='.venv-win/' --exclude='.git/' \
   --exclude='__pycache__/' --exclude='.pytest_cache/' --exclude='.ruff_cache/' \
   --exclude='build/' --exclude='dist/' --exclude='*.egg-info/' \
   --exclude='diagnostics/' --exclude='recordings/' --exclude='transcripts/' \
+  --exclude='testdata/external/' --exclude='benchmark_results/' \
   --exclude='*.wav' --exclude='*.pcm' --exclude='*.raw' \
   --exclude='.env*' --exclude='*.jsonl' --exclude='settings.json' \
   "$repo_dir/" "$target_dir/"
