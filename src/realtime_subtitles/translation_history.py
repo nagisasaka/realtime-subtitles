@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .speechmatics_api import milliseconds
+from .subtitle_view import project_subtitles
 
 TRANSLATION_CONTEXT_SEGMENTS = 5
 UNKNOWN_SPEAKERS = {None, "", "UU", "SU"}
@@ -70,6 +71,7 @@ class TranslationHistory:
     def __init__(self, context_segments=TRANSLATION_CONTEXT_SEGMENTS, *, clock=time.monotonic):
         self._lock = threading.RLock()
         self._segments = []
+        self._status_counts = {}
         self._sources = []
         self._audio_anchors = {}
         self.clock = clock
@@ -83,11 +85,31 @@ class TranslationHistory:
         self._session = None
         self._last_speaker = None
         self.context_segments = max(0, context_segments)
+        self.input_sessions = []
+
+    def begin_session(self, identity, metadata):
+        with self._lock:
+            self.clear_display()
+            self._session = identity
+            self._last_speaker = None
+            record = {"kind": "input_session", "session_id": identity, **metadata}
+            self.input_sessions.append(record)
+            self._journal.append(record)
+
+    def record_input_end(self, state):
+        with self._lock:
+            self._journal.append({"kind": "input_end", "session_id": self._session, "state": state})
+            self._revision += 1
 
     @property
     def revision(self):
         with self._lock:
             return self._revision
+
+    @property
+    def journal_cursor(self):
+        with self._lock:
+            return len(self._journal)
 
     def _record(self, segment):
         self._journal.append(
@@ -129,7 +151,7 @@ class TranslationHistory:
             if identity in self._seen:
                 return None
             self._seen.add(identity)
-            changed_session = bool(self._sources) and session_id != self._session
+            changed_session = bool(self._sources) and session_id != self._sources[-1].session_id
             boundary = changed_session or bool(
                 self._last_speaker and known_speaker and self._last_speaker != known_speaker
             )
@@ -190,6 +212,7 @@ class TranslationHistory:
                 ),
             )
             self._segments.append(unit)
+            self._status_counts["pending"] = self._status_counts.get("pending", 0) + 1
             self._record(unit)
             return unit
 
@@ -251,6 +274,8 @@ class TranslationHistory:
                 **metadata,
             )
             self._segments[sequence_id] = new
+            self._status_counts[old.translation_status] -= 1
+            self._status_counts[status] = self._status_counts.get(status, 0) + 1
             self._record(new)
 
     def segments(self):
@@ -261,7 +286,18 @@ class TranslationHistory:
         with self._lock:
             self._display_start = len(self._sources)
             self._partial = ""
+            self._partial_speaker = None
             self._revision += 1
+
+    def subtitle_view(self):
+        """O(1) latest unit + at most 20 held sources, never scan full history."""
+        with self._lock:
+            unit = self._segments[-1] if self._segments else None
+            if unit and unit.source_segment_ids[0] < self._display_start:
+                unit = None
+            after = unit.source_segment_ids[-1] + 1 if unit else self._display_start
+            pending = self._sources[max(after, len(self._sources) - 20) :]
+            return project_subtitles(unit, pending, self._partial, self._partial_speaker)
 
     def display_snapshot(self):
         with self._lock:
@@ -287,11 +323,7 @@ class TranslationHistory:
 
     def statistics(self):
         with self._lock:
-            counts = {}
-            for segment in self._segments:
-                status = segment.translation_status
-                counts[status] = counts.get(status, 0) + 1
-            return counts
+            return {k: v for k, v in self._status_counts.items() if v}
 
     def saved_text(self):
         parts = []
@@ -314,6 +346,8 @@ class TranslationHistory:
             if path.suffix.lower() == ".txt":
                 output.write(self.saved_text())
             else:
+                for record in self.input_sessions:
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
                 for segment in self.segments():
                     output.write(
                         json.dumps(

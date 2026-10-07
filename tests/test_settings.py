@@ -8,7 +8,8 @@ def test_roundtrip_and_no_secrets(tmp_path):
     settings = Settings(
         microphone="Windows WASAPI|Mic",
         geometry="1000x460-1920+600",
-        noise_reduction="near_field",
+        input_source="audio_file",
+        audio_file="C:/recordings/talk.wav",
         always_on_top=False,
         transparency=40,
         english_weight="bold",
@@ -30,7 +31,7 @@ def test_corrupt_and_out_of_range_settings(tmp_path):
                 "japanese_size": -100,
                 "always_on_top": "false",
                 "geometry": "invalid",
-                "noise_reduction": "invalid",
+                "input_source": "invalid",
                 "microphone": 4,
                 "transparency": 200,
                 "english_weight": "invalid",
@@ -40,8 +41,8 @@ def test_corrupt_and_out_of_range_settings(tmp_path):
     )
     settings = Settings.load(path)
     assert settings.english_size == 64 and settings.japanese_size == 8
-    assert settings.english_weight == "normal" and settings.japanese_weight == "bold"
+    assert settings.english_weight == "bold" and settings.japanese_weight == "normal"
     assert settings.transparency == 70
     assert settings.always_on_top is True
     assert settings.geometry == "" and settings.microphone == ""
-    assert settings.noise_reduction == "far_field"
+    assert settings.input_source == "microphone"

@@ -9,14 +9,15 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import font, ttk
+from tkinter import filedialog, font, ttk
 
 from .audio import list_microphones
+from .audio_file import inspect_wav
 from .autosave import TranscriptAutosave
 from .live_client import LiveClient
 from .realtime_api import State
 from .settings import Settings
-from .subtitle_buffer import rolling_text
+from .subtitle_view import wrap_subtitle
 
 BG = "#111318"
 
@@ -28,6 +29,8 @@ def configure_dark_style(root):
     style.configure("TFrame", background=BG)
     style.configure("TLabel", background=BG, foreground="#bec6d3")
     style.configure("TCheckbutton", background=BG, foreground=text)
+    style.configure("TRadiobutton", background=BG, foreground=text)
+    style.map("TRadiobutton", background=[("active", BG)])
     style.map("TCheckbutton", background=[("active", BG)], foreground=[("disabled", "#6b7787")])
     style.configure(
         "TButton",
@@ -157,54 +160,26 @@ def enable_dpi_awareness():
         pass
 
 
-def wrap_subtitle(text, measure, width, max_lines=3):
-    """Wrap by actual glyph widths, preferring spaces, then keep the latest lines."""
-    if width <= 0:
-        return ""
-    # Bound layout work independently of the full, lossless transcript history.
-    text = rolling_text(text, max_chars=max(80, int(width / max(1, measure("M"))) * 10))
-    lines = []
-    current = ""
-    current_width = 0
-    for char in text:
-        if char == "\n":
-            lines.append(current)
-            current, current_width = "", 0
-            continue
-        char_width = measure(char)
-        if current and current_width + char_width > width:
-            split = current.rfind(" ")
-            if split > len(current) // 3:
-                lines.append(current[:split])
-                current = current[split + 1 :]
-                current_width = sum(measure(c) for c in current)
-            elif char in "、。，．！？）」』】〉》" and len(current) > 1:
-                # Keep Japanese closing punctuation away from the beginning of a line.
-                lines.append(current[:-1])
-                current = current[-1]
-                current_width = measure(current)
-            else:
-                lines.append(current)
-                current, current_width = "", 0
-        current += char
-        current_width += char_width
-    if current:
-        lines.append(current)
-    return "\n".join(lines[-max_lines:])
-
-
 class SubtitleApp:
-    def __init__(self, root, *, client=None, settings_file=None, device_loader=list_microphones):
+    def __init__(
+        self,
+        root,
+        *,
+        client=None,
+        settings_file=None,
+        device_loader=list_microphones,
+        audio_file=None,
+    ):
         self.root = root
         self.client = client if client is not None else LiveClient()
-        self.is_live = hasattr(self.client.history, "autosave_updates")
-        self.autosave = TranscriptAutosave(
-            {"subtitles" if self.is_live else "openai": self.client.history}
-        )
-        self._live_render_revision = -1
-        self._live_rendered = {"en": "", "ja": ""}
+        self.autosave = TranscriptAutosave({"subtitles": self.client.history})
+        self._render_key = None
+        self._render_count = 0
+        self._caption_layout = {}
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
+        if audio_file is not None:
+            self.settings.input_source, self.settings.audio_file = "audio_file", audio_file
         self.device_loader = device_loader
         self.mailbox = queue.Queue()
         self.devices = []
@@ -213,20 +188,12 @@ class SubtitleApp:
         self.saving = False
         self.save_window = None
         self.local_error = ""
-        self._history_cursor = 0
-        self._display_epoch = -1
-        self._rendered_records = {}
-        self._speaker_signature = None
         self._drag = None
         self._poll_id = None
         self._save_id = None
         self.diagnostic_window = None
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
-        root.title(
-            "Realtime Subtitles · Speechmatics Agent STT + Luna"
-            if self.is_live
-            else "Realtime Subtitles · EN → 日本語"
-        )
+        root.title("Realtime Subtitles · English / 日本語")
         root.configure(bg=BG)
         root.attributes("-alpha", 1 - self.settings.transparency / 100)
         root.attributes("-topmost", self.settings.always_on_top)
@@ -240,12 +207,12 @@ class SubtitleApp:
         root.bind("<Escape>", lambda _: self.client.stop())
         root.bind("<Button-3>", self.show_settings)
         root.bind("<Control-comma>", self.show_settings)
-        self.refresh_devices()
+        self._source_changed()
         self._poll()
 
     def _place_window(self):
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width, height = min(round(1080 * self.scale), screen_w), round(280 * self.scale)
+        width, height = min(round(1080 * self.scale), screen_w), round(330 * self.scale)
         x, y = max(0, (screen_w - width) // 2), max(0, screen_h - height - 80)
         if self.settings.geometry:
             values = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", self.settings.geometry)
@@ -271,59 +238,76 @@ class SubtitleApp:
         self.settings_window.transient(self.root)
         self.settings_window.protocol("WM_DELETE_WINDOW", self.settings_window.withdraw)
         self.settings_window.bind("<Escape>", lambda _: self.settings_window.withdraw())
-        controls = ttk.Frame(self.settings_window, padding=(12, 9))
+        controls = ttk.Frame(self.settings_window, padding=12)
         controls.pack(fill="x")
-        controls.columnconfigure(3, weight=1)
-        self.start_button = ttk.Button(controls, text="Start", command=self.start)
-        self.start_button.grid(row=0, column=0, padx=(0, 5))
-        self.stop_button = ttk.Button(controls, text="Stop", command=self.client.stop)
-        self.stop_button.grid(row=0, column=1, padx=(0, 12))
-        ttk.Label(controls, text="Microphone").grid(row=0, column=2, padx=(0, 6))
-        self.microphone = ttk.Combobox(controls, state="readonly", width=34)
-        self.microphone.grid(row=0, column=3, sticky="ew")
+        self.source = tk.StringVar(value=self.settings.input_source)
+        ttk.Label(controls, text="Input Source").pack(side="left", padx=(0, 12))
+        self.source_buttons = []
+        for label, value in [("Microphone", "microphone"), ("Audio File", "audio_file")]:
+            button = ttk.Radiobutton(
+                controls,
+                text=label,
+                value=value,
+                variable=self.source,
+                command=self._source_changed,
+            )
+            button.pack(side="left", padx=5)
+            self.source_buttons.append(button)
+        self.mic_panel = ttk.Frame(self.settings_window, padding=(12, 0, 12, 8))
+        self.microphone = ttk.Combobox(self.mic_panel, state="readonly", width=65)
+        self.microphone.pack(side="left", fill="x", expand=True)
         self.microphone.bind("<<ComboboxSelected>>", lambda _: self._schedule_save())
-        self.refresh_button = ttk.Button(controls, text="Refresh", command=self.refresh_devices)
-        self.refresh_button.grid(row=0, column=4, padx=(5, 0))
-
-        options = ttk.Frame(self.settings_window, padding=(12, 0, 12, 7))
-        options.pack(fill="x")
-        noise_label = ttk.Label(options, text="Noise")
-        if not self.is_live:
-            noise_label.pack(side="left")
-        self.noise = ttk.Combobox(
-            options, values=["far_field", "near_field"], state="readonly", width=10
+        self.refresh_button = ttk.Button(
+            self.mic_panel, text="Refresh", command=self.refresh_devices
         )
-        self.noise.set(self.settings.noise_reduction)
-        if not self.is_live:
-            self.noise.pack(side="left", padx=(5, 14))
-        self.noise.bind("<<ComboboxSelected>>", lambda _: self._schedule_save())
+        self.refresh_button.pack(side="left", padx=5)
+        self.file_panel = ttk.Frame(self.settings_window, padding=(12, 0, 12, 8))
+        self.file_path = tk.StringVar(value=self.settings.audio_file)
+        self.file_entry = ttk.Entry(self.file_panel, textvariable=self.file_path, width=68)
+        self.file_entry.pack(side="left", fill="x", expand=True)
+        self.file_entry.bind("<Return>", lambda _: self._inspect_file())
+        self.file_entry.bind("<FocusOut>", lambda _: self._inspect_file())
+        self.browse_button = ttk.Button(self.file_panel, text="Browse…", command=self._browse_file)
+        self.browse_button.pack(side="left", padx=5)
+        self.file_info = tk.StringVar()
+        self.file_info_label = ttk.Label(self.settings_window, textvariable=self.file_info)
+
+        options = ttk.Frame(self.settings_window, padding=12)
+        options.pack(fill="x")
+        self.options_panel = options
+        self.start_button = ttk.Button(options, text="Start", command=self.start)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(options, text="Stop", command=self.client.stop)
+        self.stop_button.pack(side="left", padx=6)
         self.topmost = tk.BooleanVar(value=self.settings.always_on_top)
         ttk.Checkbutton(
             options, text="Always on Top", variable=self.topmost, command=self._toggle_topmost
+        ).pack(side="left", padx=6)
+        self.click_through = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            options,
+            text="Click-through (Ctrl+Alt+F10で解除)",
+            variable=self.click_through,
+            command=self._toggle_click_through,
         ).pack(side="left")
+        self._hotkey = False
         ttk.Button(options, text="Clear", command=self.client.history.clear_display).pack(
-            side="right", padx=(5, 0)
+            side="right"
         )
-        ttk.Button(options, text="Save", command=self.save_transcript).pack(side="right")
-
-        appearance = ttk.Frame(self.settings_window, padding=(12, 0, 12, 7))
+        ttk.Button(options, text="Save", command=self.save_transcript).pack(side="right", padx=6)
+        appearance = ttk.Frame(self.settings_window, padding=(12, 0, 12, 8))
         appearance.pack(fill="x")
         self.en_size = tk.IntVar(value=self.settings.english_size)
         self.ja_size = tk.IntVar(value=self.settings.japanese_size)
         self.en_weight = tk.StringVar(value=self.settings.english_weight)
         self.ja_weight = tk.StringVar(value=self.settings.japanese_weight)
-        for label, var, weight, low, high in [
-            ("英語 px", self.en_size, self.en_weight, 8, 64),
-            ("日本語 px", self.ja_size, self.ja_weight, 8, 64),
+        for label, var, weight in [
+            ("英語 px", self.en_size, self.en_weight),
+            ("日本語 px", self.ja_size, self.ja_weight),
         ]:
             ttk.Label(appearance, text=label).pack(side="left", padx=(0, 4))
             box = ttk.Spinbox(
-                appearance,
-                from_=low,
-                to=high,
-                width=4,
-                textvariable=var,
-                command=self._font_changed,
+                appearance, from_=8, to=64, width=4, textvariable=var, command=self._font_changed
             )
             box.pack(side="left", padx=(0, 4))
             box.bind("<Return>", lambda _: self._font_changed())
@@ -337,7 +321,7 @@ class SubtitleApp:
             )
             weight_box.pack(side="left", padx=(0, 14))
             weight_box.bind("<<ComboboxSelected>>", lambda _: self._font_changed())
-        ttk.Label(appearance, text="透明度").pack(side="left", padx=(0, 6))
+        ttk.Label(appearance, text="透明度").pack(side="left")
         self.transparency = tk.DoubleVar(value=self.settings.transparency)
         self.transparency_text = tk.StringVar(value=f"{self.settings.transparency}%")
         ttk.Label(appearance, textvariable=self.transparency_text, width=5).pack(side="right")
@@ -347,68 +331,100 @@ class SubtitleApp:
             to=70,
             variable=self.transparency,
             command=self._transparency_changed,
-        ).pack(side="left", fill="x", expand=True, padx=(0, 8))
-
+        ).pack(side="left", fill="x", expand=True)
         details = ttk.Frame(self.settings_window, padding=12)
         details.pack(fill="x")
-        ttk.Label(details, text="字幕上でホイール：過去ログ ／ End：最新へ戻る").pack(anchor="w")
         ttk.Label(
             details,
-            text=(
-                "Speechmaticsで話者交代を検出すると、英語・日本語の両方に空行を入れます。"
-                if self.is_live
-                else "話者交代を検出すると、字幕の対応位置に後から空行を追加します。"
-            ),
-            wraplength=650,
-        ).pack(anchor="w", pady=(5, 0))
-        ttk.Label(details, text=f"自動保存先: {self.autosave.directory}", wraplength=500).pack(
-            fill="x"
+            text="確定EN 1行・ライブEN 2行・JA 2行。履歴は自動保存ファイルで確認できます。",
+            wraplength=640,
+        ).pack(anchor="w")
+        ttk.Label(details, text=f"自動保存先: {self.autosave.directory}", wraplength=600).pack(
+            anchor="w"
         )
-        if self.is_live:
-            ttk.Button(details, text="未翻訳を再試行", command=self.client.retry_translations).pack(
-                anchor="e"
-            )
+        ttk.Button(details, text="未翻訳を再試行", command=self.client.retry_translations).pack(
+            anchor="e"
+        )
         ttk.Button(details, text="Diagnostics", command=self.show_diagnostics).pack(anchor="e")
-        status = ttk.Frame(self.root, padding=(12, 7, 12, 4))
+        self.transcript_status = tk.StringVar()
+        ttk.Label(details, textvariable=self.transcript_status).pack(anchor="w")
+        self.error_var = tk.StringVar()
+        self.error_label = ttk.Label(
+            details, textvariable=self.error_var, foreground="#ffb4a9", wraplength=640
+        )
+        self.error_label.pack(fill="x")
+
+        status = ttk.Frame(self.root, padding=(16, 6))
         status.pack(fill="x")
         self.status_var = tk.StringVar(value="STOPPED")
         ttk.Label(status, textvariable=self.status_var).pack(side="left", padx=(0, 12))
-        self.level = ttk.Progressbar(status, maximum=60, length=110)
-        self.level.pack(side="left", padx=(4, 8))
-        self.level_text = tk.StringVar(value="Mic: −120 dBFS")
+        self.level = ttk.Progressbar(status, maximum=60, length=90)
+        self.level.pack(side="left", padx=(0, 8))
+        self.level_text = tk.StringVar()
         ttk.Label(status, textvariable=self.level_text).pack(side="left")
         self.settings_button = ttk.Button(status, text="設定", command=self.show_settings, width=5)
         self.settings_button.pack(side="right")
-        self.latest_button = ttk.Button(status, text="↓ 最新", command=self._resume_follow, width=7)
-        self.transcript_status = tk.StringVar()
-        ttk.Label(details, textvariable=self.transcript_status).pack(anchor="w")
+        self.speaker_var = tk.StringVar()
+        ttk.Label(status, textvariable=self.speaker_var).pack(side="right", padx=16)
+        self.progress = ttk.Progressbar(status, maximum=100, length=100)
         for widget in [status, *status.winfo_children()]:
-            if widget in (self.settings_button, self.latest_button):
-                continue
-            widget.bind("<ButtonPress-1>", self._drag_start)
-            widget.bind("<B1-Motion>", self._drag_move)
-        self.error_var = tk.StringVar()
-        self.error_label = tk.Label(
-            self.settings_window,
-            textvariable=self.error_var,
-            bg=BG,
-            fg="#ffb4a9",
-            anchor="w",
-            justify="left",
-            font=("Segoe UI", 9),
+            if widget is not self.settings_button:
+                widget.bind("<ButtonPress-1>", self._drag_start)
+                widget.bind("<B1-Motion>", self._drag_move)
+
+    def _source_changed(self):
+        if self.client.active:
+            return
+        self.mic_panel.pack_forget()
+        self.file_panel.pack_forget()
+        self.file_info_label.pack_forget()
+        if self.source.get() == "audio_file":
+            self.file_panel.pack(fill="x", before=self.options_panel)
+            self.file_info_label.pack(fill="x", padx=12, before=self.options_panel)
+            self.progress.pack(side="left", padx=10)
+            self._inspect_file()
+        else:
+            self.mic_panel.pack(fill="x", before=self.options_panel)
+            self.progress.pack_forget()
+            self.refresh_devices()
+        self._schedule_save()
+
+    def _browse_file(self):
+        if self.client.active:
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.settings_window, title="PCM16 WAVを選択", filetypes=[("PCM16 WAV", "*.wav")]
         )
-        self.error_label.pack(fill="x", padx=12, pady=(0, 4))
+        if selected:
+            self.file_path.set(selected)
+            self._inspect_file()
+
+    def _inspect_file(self):
+        path = self.file_path.get()
+        if not path:
+            self.file_info.set("PCM16 WAV / mono・stereo。音声モニター OFF（スピーカー再生なし）")
+            return
+
+        def work():
+            try:
+                info = inspect_wav(path)
+                self.mailbox.put(("file_info", (path, info)))
+            except Exception as exc:
+                self.mailbox.put(("file_info", (path, str(exc))))
+
+        threading.Thread(target=work, name="wav-inspect", daemon=True).start()
+        self._schedule_save()
 
     def _build_captions(self):
-        captions = tk.Frame(self.root, bg=BG)
-        captions.pack(fill="both", expand=True, padx=18, pady=(4, 14))
-        captions.columnconfigure(0, weight=1)
-        captions.rowconfigure(0, weight=2)
-        captions.rowconfigure(1, weight=3)
+        self.captions = tk.Frame(self.root, bg=BG)
+        self.captions.pack(fill="both", expand=True, padx=24, pady=(8, 16))
         self.en_font = font.Font(
             family="Segoe UI",
             size=-round(self.en_size.get() * self.scale),
             weight=self.en_weight.get(),
+        )
+        self.confirmed_font = font.Font(
+            family="Segoe UI", size=-round(self.en_size.get() * 0.9 * self.scale), weight="normal"
         )
         self.ja_font = font.Font(
             family="Yu Gothic UI",
@@ -416,237 +432,150 @@ class SubtitleApp:
             weight=self.ja_weight.get(),
         )
         self.caption_widgets = {}
-        self.follow_latest = {"en": True, "ja": True}
-        for row, language, caption_font, foreground in [
-            (0, "en", self.en_font, "#bbc3cf"),
-            (1, "ja", self.ja_font, "#ffffff"),
+        for name, face, color in [
+            ("confirmed", self.confirmed_font, "#bdc5d2"),
+            ("partial", self.en_font, "#ffffff"),
+            ("ja", self.ja_font, "#e9eef6"),
         ]:
-            pane = tk.Frame(captions, bg=BG)
-            pane.grid(row=row, column=0, sticky="nsew", pady=(0, 8) if row == 0 else 0)
-            text = tk.Text(
-                pane,
+            widget = tk.Label(
+                self.captions,
                 bg=BG,
-                fg=foreground,
-                font=caption_font,
-                height=3,
-                width=1,
-                wrap="word",
-                state="disabled",
-                relief="flat",
-                borderwidth=0,
-                highlightthickness=0,
+                fg=color,
+                font=face,
+                anchor="nw",
+                justify="left",
+                bd=0,
                 padx=0,
                 pady=0,
-                cursor="arrow",
-                selectbackground="#34445c",
-                selectforeground="#ffffff",
-                takefocus=True,
             )
-            bar = ttk.Scrollbar(
-                pane,
-                orient="vertical",
-                command=lambda *args, lang=language: self._scroll_caption(lang, *args),
-            )
-            text.configure(yscrollcommand=bar.set)
-            bar.pack(side="right", fill="y")
-            text.pack(side="left", fill="both", expand=True)
-            self.caption_widgets[language] = text
-            text.bind("<MouseWheel>", lambda event, lang=language: self._wheel(event, lang))
-            for key, args in [
-                ("Up", ("scroll", -1, "units")),
-                ("Down", ("scroll", 1, "units")),
-                ("Prior", ("scroll", -1, "pages")),
-                ("Next", ("scroll", 1, "pages")),
-                ("Home", ("moveto", 0)),
-                ("End", ("moveto", 1)),
-            ]:
-                text.bind(
-                    f"<{key}>",
-                    lambda event, lang=language, values=args: self._scroll_caption(lang, *values),
-                )
-        self.en_text = self.caption_widgets["en"]
+            self.caption_widgets[name] = widget
+            widget.bind("<ButtonPress-1>", self._drag_start)
+            widget.bind("<B1-Motion>", self._drag_move)
+        self.en_text = self.caption_widgets["confirmed"]
+        self.partial_text = self.caption_widgets["partial"]
         self.ja_text = self.caption_widgets["ja"]
+        self.ja_hint = tk.Label(
+            self.captions,
+            text="確定ENの訳",
+            font=("Yu Gothic UI", -round(12 * self.scale)),
+            bg=BG,
+            fg="#8693a8",
+            anchor="w",
+            padx=0,
+        )
+        self.captions.bind("<Configure>", lambda _: self._layout_captions())
+        self._layout_captions()
+
+    def _layout_captions(self):
+        width = min(max(1, self.captions.winfo_width()), round(1100 * self.scale))
+        x = max(0, (self.captions.winfo_width() - width) // 2)
+        gap = round(12 * self.scale)
+        confirmed = self.confirmed_font.metrics("linespace")
+        live = self.en_font.metrics("linespace") * 2
+        ja = self.ja_font.metrics("linespace") * 2
+        hint = round(20 * self.scale)
+        self.en_text.place(x=x, y=0, width=width, height=confirmed)
+        self.partial_text.place(x=x, y=confirmed + gap, width=width, height=live)
+        self.ja_hint.place(x=x, y=confirmed + live + 2 * gap, width=width, height=hint)
+        self.ja_text.place(x=x, y=confirmed + live + 2 * gap + hint, width=width, height=ja)
+        self.root.minsize(
+            round(480 * self.scale), confirmed + live + ja + hint + 2 * gap + round(86 * self.scale)
+        )
+        self._render_key = None
+        self._caption_layout.clear()
 
     def show_settings(self, event=None):
         self.settings_window.deiconify()
         self.settings_window.lift()
         return "break"
 
-    def _scroll_caption(self, language, *args):
-        widget = self.caption_widgets[language]
-        widget.yview(*args)
-        if args[0] == "moveto" and float(args[1]) >= 1:
-            self.follow_latest[language] = True
-        else:
-            self.follow_latest[language] = widget.yview()[1] >= 0.999
-        self._update_follow_button()
-        return "break"
-
-    def _resume_follow(self):
-        for language, widget in self.caption_widgets.items():
-            self.follow_latest[language] = True
-            widget.yview_moveto(1)
-        self._update_follow_button()
-
-    def _update_follow_button(self):
-        if all(self.follow_latest.values()):
-            self.latest_button.pack_forget()
-        else:
-            self.latest_button.pack(side="right", padx=(0, 8))
-
-    def _wheel(self, event, language):
-        if event.delta:
-            direction = -1 if event.delta > 0 else 1
-            self._scroll_caption(
-                language, "scroll", direction * max(1, abs(event.delta) // 120) * 3, "units"
-            )
-        return "break"
-
     def _render_history(self):
-        if self.is_live:
-            self._render_live_history()
+        view = self.client.history.subtitle_view()
+        width = max(1, self.en_text.winfo_width())
+        key = (view, width)
+        if key == self._render_key:
             return
-        epoch, cursor, records = self.client.history.display_records(self._history_cursor)
-        if epoch != self._display_epoch:
-            for language, widget in self.caption_widgets.items():
-                widget.configure(state="normal")
-                widget.delete("1.0", "end")
-                for mark in widget.mark_names():
-                    if mark.startswith("raw_delta_"):
-                        widget.mark_unset(mark)
-                widget.configure(state="disabled")
-                self.follow_latest[language] = True
-            self._display_epoch = epoch
-            self._rendered_records.clear()
-            self._speaker_signature = None
-            self._update_follow_button()
-        for language, widget in self.caption_widgets.items():
-            added = "".join(r["delta"] for r in records if r["language"] == language)
-            if not added:
-                if self.follow_latest[language]:
-                    widget.see("end-1c")
-                continue
-            top = widget.index("@0,0")
-            widget.configure(state="normal")
-            for record in records:
-                if record["language"] != language:
-                    continue
-                mark = f"raw_delta_{record['sequence']}"
-                widget.mark_set(mark, "end-1c")
-                widget.mark_gravity(mark, "left")
-                widget.insert("end", record["delta"], ())
-                self._rendered_records[record["sequence"]] = record
-            widget.configure(state="disabled")
-            if self.follow_latest[language]:
-                widget.see("end-1c")
-            else:
-                widget.yview(top)
-        self._history_cursor = cursor
-        self._render_speaker_breaks()
-
-    def _render_live_history(self):
-        revision, epoch, segments, partial, partial_break = self.client.history.display_snapshot()
-        if revision == self._live_render_revision:
-            for lang, widget in self.caption_widgets.items():
-                if self.follow_latest[lang]:
-                    widget.see("end-1c")
-            return
-        if epoch != self._display_epoch:
-            self.follow_latest = {"en": True, "ja": True}
-            self._display_epoch = epoch
-            self._update_follow_button()
-        for lang, widget in self.caption_widgets.items():
-            parts = []
-            items = self.client.history.english_display() if lang == "en" else segments
-            for segment in items:
-                if parts:
-                    parts.append("\n\n" if segment.break_before else " ")
-                if lang == "en":
-                    parts.append(segment.en_text)
-                elif segment.ja_text is not None:
-                    parts.append(segment.ja_text)
-                else:
-                    pending = segment.translation_status in {"pending", "translating", "retrying"}
-                    parts.append(
-                        "［翻訳待ち…］"
-                        if pending
-                        else "［翻訳検証エラー］"
-                        if segment.translation_status == "validation_failed"
-                        else "［未翻訳］"
-                    )
-            base = "".join(parts)
-            suffix = (
-                ("\n\n" if base and partial_break else " " if base else "") + partial
-                if lang == "en" and partial
-                else ""
+        self._render_key = key
+        self._render_count += 1
+        values = [
+            (self.en_text, view.confirmed_en, self.confirmed_font, 1),
+            (self.partial_text, view.live_en_partial, self.en_font, 2),
+            (self.ja_text, view.ja_text, self.ja_font, 2),
+        ]
+        if not view.ja_text and view.confirmed_unit_id is not None:
+            status = view.translation_status
+            message = (
+                "翻訳待ち…"
+                if status in {"pending", "translating", "retrying"}
+                else "翻訳検証エラー"
+                if status == "validation_failed"
+                else "未翻訳"
             )
-            new = base + suffix
-            old = self._live_rendered[lang]
-            prefix = 0
-            for a, b in zip(old, new, strict=False):
-                if a != b:
-                    break
-                prefix += 1
-            tail = 0
-            while tail < min(len(old), len(new)) - prefix and old[-tail - 1] == new[-tail - 1]:
-                tail += 1
-
-            def index(text, count, widget=widget):
-                return f"1.0+{widget.tk.call('string', 'length', text[:count])}c"
-
-            widget.mark_set("live_view", "@0,0")
-            widget.mark_gravity("live_view", "right")
-            widget.configure(state="normal")
-            if old != new:
-                widget.delete(index(old, prefix), index(old, len(old) - tail))
-                widget.insert(index(new, prefix), new[prefix : len(new) - tail])
-            widget.tag_configure("partial", foreground="#858d99")
-            widget.tag_remove("partial", "1.0", "end")
-            if suffix:
-                widget.tag_add("partial", index(new, len(base)), "end-1c")
-            widget.configure(state="disabled")
-            if self.follow_latest[lang]:
-                widget.see("end-1c")
-            else:
-                widget.yview("live_view")
-            self._live_rendered[lang] = new
-        self._live_render_revision = revision
-
-    def _render_speaker_breaks(self):
-        revision, boundaries = self.client.history.speaker_boundaries.snapshot()
-        positions = {lang: set() for lang in self.caption_widgets}
-        for boundary in boundaries:
-            for language, anchor in boundary.positions.items():
-                if anchor.sequence in self._rendered_records:
-                    positions[language].add((anchor.sequence, anchor.offset))
-        signature = (
-            revision,
-            tuple((lang, tuple(sorted(items))) for lang, items in positions.items()),
-        )
-        if signature == self._speaker_signature:
-            return
-        for language, widget in self.caption_widgets.items():
-            ranges = widget.tag_ranges("speaker_break")
-            if not ranges and not positions[language]:
+            values[-1] = (self.ja_text, message, self.ja_font, 2)
+        for widget, text, face, lines in values:
+            layout_key = (text, width, lines)
+            if self._caption_layout.get(widget) == layout_key:
                 continue
-            widget.mark_set("speaker_view", "@0,0")
-            widget.mark_gravity("speaker_view", "right")
-            widget.configure(state="normal")
-            for start, end in reversed(list(zip(ranges[::2], ranges[1::2], strict=True))):
-                widget.delete(start, end)
-            # Only synthetic markers are edited. Raw delta marks/text stay intact.
-            for sequence, offset in sorted(positions[language], reverse=True):
-                prefix = self._rendered_records[sequence]["delta"][:offset]
-                count = widget.tk.call("string", "length", prefix)
-                index = f"raw_delta_{sequence}+{count}c"
-                if widget.compare(index, ">", "1.0"):
-                    widget.insert(index, "\n\n", ("speaker_break",))
-            widget.configure(state="disabled")
-            if self.follow_latest[language]:
-                widget.see("end-1c")
+            value = wrap_subtitle(text, face.measure, width, lines)
+            if widget.cget("text") != value:
+                widget.configure(text=value)
+            self._caption_layout[widget] = layout_key
+        self.speaker_var.set(("↳ " if view.speaker_changed else "") + (view.speaker or ""))
+
+    def _toggle_click_through(self):
+        if sys.platform != "win32":
+            self.click_through.set(False)
+            return
+        user = ctypes.windll.user32
+        user.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user.GetAncestor.restype = ctypes.c_void_p
+        user.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        hwnd = user.GetAncestor(self.root.winfo_id(), 2)
+        user.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+        user.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        user.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user.CallWindowProcW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        ]
+        user.CallWindowProcW.restype = ctypes.c_ssize_t
+        if self.click_through.get() and not self._hotkey:
+            self._hotkey = bool(user.RegisterHotKey(hwnd, 0x5342, 0x4003, 0x79))
+            if self._hotkey:
+                callback = ctypes.WINFUNCTYPE(
+                    ctypes.c_ssize_t,
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.c_size_t,
+                    ctypes.c_ssize_t,
+                )
+
+                def receive(window, message, wparam, lparam):
+                    if message == 0x312 and wparam == 0x5342:
+                        self.mailbox.put(("hotkey", None))
+                        return 0
+                    return user.CallWindowProcW(
+                        self._original_proc, window, message, wparam, lparam
+                    )
+
+                self._window_proc = callback(receive)
+                self._original_proc = user.SetWindowLongPtrW(hwnd, -4, self._window_proc)
             else:
-                widget.yview("speaker_view")
-        self._speaker_signature = signature
+                self.click_through.set(False)
+                self.local_error = "Ctrl+Alt+F10を登録できないためClick-throughを有効にできません。"
+        style = user.GetWindowLongW(hwnd, -20)
+        user.SetWindowLongW(
+            hwnd, -20, (style | 0x20) if self.click_through.get() else (style & ~0x20)
+        )
+        if not self.click_through.get() and self._hotkey:
+            user.UnregisterHotKey(hwnd, 0x5342)
+            user.SetWindowLongPtrW(hwnd, -4, self._original_proc)
+            self._hotkey = False
 
     def _drag_start(self, event):
         self._drag = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
@@ -673,6 +602,8 @@ class SubtitleApp:
         self.ja_size.set(ja)
         self.en_font.configure(size=-round(en * self.scale), weight=self.en_weight.get())
         self.ja_font.configure(size=-round(ja * self.scale), weight=self.ja_weight.get())
+        self.confirmed_font.configure(size=-round(en * 0.9 * self.scale))
+        self._layout_captions()
         self._schedule_save()
 
     def _transparency_changed(self, value):
@@ -710,7 +641,8 @@ class SubtitleApp:
         self.settings.always_on_top = self.topmost.get()
         self.settings.english_weight = self.en_weight.get()
         self.settings.japanese_weight = self.ja_weight.get()
-        self.settings.noise_reduction = self.noise.get()
+        self.settings.input_source = self.source.get()
+        self.settings.audio_file = self.file_path.get()
         self.settings.transparency = max(0, min(70, round(self.transparency.get())))
         try:
             self.settings.save(self.settings_file)
@@ -731,14 +663,15 @@ class SubtitleApp:
         threading.Thread(target=work, name="device-discovery", daemon=True).start()
 
     def start(self):
-        if self.refreshing:
+        if self.client.active or (self.refreshing and self.source.get() == "microphone"):
             return
-        self._resume_follow()
         self.local_error = ""
         index = self.microphone.current()
         device = self.devices[index - 1].index if index > 0 else None
         self._save_settings()
-        self.client.start(device, self.noise.get())
+        self.client.start(
+            device, audio_file=self.file_path.get() if self.source.get() == "audio_file" else None
+        )
 
     def save_transcript(self):
         if self.closing:
@@ -826,7 +759,11 @@ class SubtitleApp:
         try:
             while True:
                 kind, value = self.mailbox.get_nowait()
-                if kind == "devices":
+                if kind == "hotkey":
+                    self.click_through.set(False)
+                    self._toggle_click_through()
+                    self.show_settings()
+                elif kind == "devices":
                     self.refreshing = False
                     self.devices = value
                     default = next((d.name for d in value if d.is_default), "未検出")
@@ -840,6 +777,16 @@ class SubtitleApp:
                     self.local_error = (
                         "" if value else "入力マイクがありません。接続後にRefreshしてください。"
                     )
+                elif kind == "file_info":
+                    path, info = value
+                    if path == self.file_path.get():
+                        self.file_info.set(
+                            info
+                            if isinstance(info, str)
+                            else f"{info['audio_duration_ms'] / 1000:.1f}s · WAV / "
+                            f"{info['audio_sample_rate'] / 1000:g} kHz / "
+                            f"{info['audio_channels']} ch · PCM16 · モニター OFF"
+                        )
                 elif kind == "device_error":
                     self.refreshing = False
                     self.local_error = f"マイク一覧取得エラー: {value}"
@@ -854,43 +801,64 @@ class SubtitleApp:
         except queue.Empty:
             pass
         snapshot = self.client.snapshot()
-        self.status_var.set(snapshot["state"])
-        english_state = snapshot.get("english_connection")
-        if snapshot["state"] == State.RUNNING and english_state not in {None, "RUNNING"}:
-            self.status_var.set(f"RUNNING / EN {english_state}")
+        is_file = self.source.get() == "audio_file"
+        self.status_var.set(
+            snapshot.get("playback_state", "Idle") if is_file else snapshot["state"]
+        )
+        if is_file and snapshot.get("playback_state") == "Finished":
+            if (
+                self.autosave.flushed_cursor.get("subtitles", 0)
+                < self.client.history.journal_cursor
+            ):
+                self.status_var.set("Draining / 保存中")
+                self.autosave.request_flush()
         snapshot["autosave"] = self.autosave.snapshot()
         self.error_var.set(
             self.autosave.error
             or snapshot.get("recording", {}).get("error")
             or snapshot.get("translation_error")
             or snapshot["error"]
-            or snapshot.get("english_error")
             or self.local_error
         )
-        self.error_label.configure(wraplength=max(100, self.root.winfo_width() - 24))
-        busy = self.client.active or self.refreshing or self.closing
-        self.start_button.configure(state="disabled" if busy else "normal")
-        self.stop_button.configure(
-            state="normal"
-            if snapshot["state"] not in {State.STOPPED, State.STOPPING}
-            else "disabled"
+        busy = self.client.active or self.closing
+        self.start_button.configure(
+            state="disabled" if busy or (self.refreshing and not is_file) else "normal"
         )
-        for control in [self.microphone, self.noise]:
-            control.configure(state="disabled" if busy else "readonly")
-        self.refresh_button.configure(state="disabled" if busy else "normal")
+        self.stop_button.configure(state="normal" if self.client.active else "disabled")
+        self.microphone.configure(state="disabled" if busy else "readonly")
+        for control in [
+            self.refresh_button,
+            self.browse_button,
+            self.file_entry,
+            *self.source_buttons,
+        ]:
+            control.configure(state="disabled" if busy else "normal")
         dbfs = snapshot.get("dbfs", -120) if self.client.state == State.RUNNING else -120
         self.level.configure(value=max(0, min(60, dbfs + 60)))
-        self.level_text.set(f"Mic: {dbfs:.0f} dBFS")
-        delayed = snapshot.get("source_delayed") and self.client.state == State.RUNNING
-        if self.is_live:
-            counts = snapshot.get("translation_status", {})
-            pending = counts.get("pending", 0) + counts.get("translating", 0)
-            missing = sum(counts.get(k, 0) for k in ("failed", "skipped", "cancelled"))
-            self.transcript_status.set(
-                f"翻訳待ち {pending} / 未翻訳 {missing}" if pending or missing else ""
+        if is_file:
+            position, duration = (
+                snapshot.get("position_ms", 0),
+                snapshot.get("audio_duration_ms", 0),
             )
+
+            def stamp(ms):
+                seconds = max(0, ms) // 1000
+                return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+            self.level_text.set(
+                f"{Path(self.file_path.get()).name}  {stamp(position)} / {stamp(duration)}"
+            )
+            self.progress.configure(value=position * 100 / max(1, duration))
         else:
-            self.transcript_status.set("英語の受信待ち（日本語は受信中）" if delayed else "")
+            self.level_text.set(f"Mic: {dbfs:.0f} dBFS")
+        counts = snapshot.get("translation_status", {})
+        pending = sum(counts.get(k, 0) for k in ("pending", "translating", "retrying"))
+        missing = sum(
+            counts.get(k, 0) for k in ("failed", "skipped", "cancelled", "validation_failed")
+        )
+        self.transcript_status.set(
+            f"翻訳待ち {pending} / 未翻訳 {missing}" if pending or missing else ""
+        )
 
         self._render_history()
         if self.diagnostic_window and self.diagnostic_window.winfo_exists():
@@ -904,11 +872,11 @@ class SubtitleApp:
         if self.closing and not self.client.active and not self.saving:
             self.autosave.request_close()
             if self.autosave.active:
-                self._poll_id = self.root.after(50, self._poll)
+                self._poll_id = self.root.after(33, self._poll)
                 return
             self.root.destroy()
             return
-        self._poll_id = self.root.after(50, self._poll)
+        self._poll_id = self.root.after(33, self._poll)
 
     def close(self):
         if self.closing:
@@ -918,14 +886,14 @@ class SubtitleApp:
             self._save_id = None
         self._save_settings()
         self.closing = True
-        if not self.is_live:
-            self.client._diarization.close()
+        self.click_through.set(False)
+        self._toggle_click_through()
         self.client.stop()
 
 
-def run_gui(*, client=None):
+def run_gui(*, client=None, audio_file=None):
     enable_dpi_awareness()
     root = tk.Tk()
-    SubtitleApp(root, client=client)
+    SubtitleApp(root, client=client, audio_file=audio_file)
     root.mainloop()
     return 0

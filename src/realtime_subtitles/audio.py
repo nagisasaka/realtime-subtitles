@@ -93,10 +93,11 @@ class AudioConverter:
             del self.pending[:FRAME_BYTES]
         return chunks
 
-    def finish(self):
+    def finish(self, *, pad=True):
         chunks = self.feed(np.empty(0, dtype=np.float32), last=True)
         if self.pending:
-            chunks.append(bytes(self.pending).ljust(FRAME_BYTES, b"\0"))
+            tail = bytes(self.pending)
+            chunks.append(tail.ljust(FRAME_BYTES, b"\0") if pad else tail)
             self.pending.clear()
         return chunks
 

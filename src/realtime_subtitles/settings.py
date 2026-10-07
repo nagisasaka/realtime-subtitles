@@ -13,14 +13,15 @@ def settings_path():
 @dataclass
 class Settings:
     microphone: str = ""
+    input_source: str = "microphone"
+    audio_file: str = ""
     geometry: str = ""
-    english_size: int = 18
-    japanese_size: int = 28
-    english_weight: str = "normal"
-    japanese_weight: str = "bold"
+    english_size: int = 30
+    japanese_size: int = 29
+    english_weight: str = "bold"
+    japanese_weight: str = "normal"
     transparency: int = 25
     always_on_top: bool = True
-    noise_reduction: str = "far_field"
 
     @classmethod
     def load(cls, path=None):
@@ -39,11 +40,11 @@ class Settings:
         result.japanese_size = max(8, min(64, result.japanese_size))
         result.transparency = max(0, min(70, result.transparency))
         if result.english_weight not in {"normal", "bold"}:
-            result.english_weight = "normal"
+            result.english_weight = "bold"
         if result.japanese_weight not in {"normal", "bold"}:
-            result.japanese_weight = "bold"
-        if result.noise_reduction not in {"near_field", "far_field"}:
-            result.noise_reduction = "far_field"
+            result.japanese_weight = "normal"
+        if result.input_source not in {"microphone", "audio_file"}:
+            result.input_source = "microphone"
         if not re.fullmatch(r"\d{3,5}x\d{3,5}[+-]\d{1,6}[+-]\d{1,6}", result.geometry):
             result.geometry = ""
         return result

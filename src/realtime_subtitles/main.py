@@ -17,7 +17,7 @@ def console(args):
     seen = set()
     partial = None
     next_diagnostic = 0.0
-    client.start(args.device)
+    client.start(args.device, audio_file=args.audio_file)
     started = time.monotonic()
 
     def print_updates():
@@ -97,6 +97,7 @@ def main():
         "--probe-mic", action="store_true", help="Test microphone without API access"
     )
     parser.add_argument("--device", type=int, help="Input device index; default is OS input")
+    parser.add_argument("--audio-file", help="Replay PCM16 WAV in real time, without microphone")
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--seconds", type=float, help="Stop console mode after this many seconds")
     parser.add_argument("--save", help="Save console transcript history as UTF-8 JSONL")
@@ -142,7 +143,7 @@ def main():
         return console(args)
     from .ui import run_gui
 
-    return run_gui(client=LiveClient())
+    return run_gui(client=LiveClient(), audio_file=args.audio_file)
 
 
 if __name__ == "__main__":

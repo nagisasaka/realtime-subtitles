@@ -54,6 +54,9 @@ class TranscriptAutosave:
         self._text_due = dict.fromkeys(histories, 0.0)
         self._dirty_text = set(histories)
         self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._force_flush = threading.Event()
+        self.flushed_cursor = dict.fromkeys(histories, 0)
         self._thread = threading.Thread(target=self._run, name="transcript-autosave", daemon=True)
         self._thread.start()
 
@@ -75,6 +78,11 @@ class TranscriptAutosave:
 
     def request_close(self):
         self._stop.set()
+        self._wake.set()
+
+    def request_flush(self):
+        self._force_flush.set()
+        self._wake.set()
 
     def close(self, timeout=5):
         self.request_close()
@@ -140,6 +148,8 @@ class TranscriptAutosave:
         os.replace(temporary, path)
 
     def _cycle(self):
+        force = self._force_flush.is_set()
+        self._force_flush.clear()
         for provider, history in self.histories.items():
             try:
                 self.directory.mkdir(parents=True, exist_ok=True)
@@ -158,9 +168,10 @@ class TranscriptAutosave:
                     self.last_saved_at = now
                     self._dirty_text.add(provider)
                 if provider in self._dirty_text and (
-                    self._stop.is_set() or time.monotonic() >= self._text_due[provider]
+                    force or self._stop.is_set() or time.monotonic() >= self._text_due[provider]
                 ):
                     self._export_text(provider, history)
+                    self.flushed_cursor[provider] = self.cursors[provider]
                     self._dirty_text.discard(provider)
                     self._text_due[provider] = time.monotonic() + TEXT_SECONDS
                 self.errors.pop(provider, None)
@@ -177,4 +188,5 @@ class TranscriptAutosave:
             if closing:
                 time.sleep(POLL_SECONDS)
             else:
-                self._stop.wait(POLL_SECONDS)
+                self._wake.wait(POLL_SECONDS)
+                self._wake.clear()

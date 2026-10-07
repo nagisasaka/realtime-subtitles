@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .audio import FRAME_BYTES, OUTPUT_RATE, LatestQueue
+from .audio_file import RealtimePacer
 
 ENDPOINT = "wss://global.rt.speechmatics.com/v2/"
 EVENTS = ("AddPartialTranscript", "AddTranscript")
@@ -218,6 +219,9 @@ class SpeechmaticsClient:
         self.loop = None
         self.task = None
         self.session_ready = False
+        self.file_input = False
+        self.on_audio_sent = None
+        self.eos_received = False
 
     @property
     def active(self):
@@ -305,6 +309,7 @@ class SpeechmaticsClient:
             server_error, ended = [], []
             client = self._new_sdk(key)
             self.sent_frames = self.acknowledged = 0
+            self.eos_received = False
             self.session_ready = False
 
             def receive(event, server_error=server_error, ended=ended):
@@ -341,7 +346,10 @@ class SpeechmaticsClient:
                     self.on_session(self.session_id)
                 self.session_ready = True
                 self.state, self.error = "RUNNING", ""
-                while not self.stop_requested.is_set():
+                pacer = RealtimePacer()
+                while not self.stop_requested.is_set() or (
+                    self.file_input and not self.frames.empty()
+                ):
                     if server_error or ended:
                         raise ConnectionError("Session ended")
                     try:
@@ -349,12 +357,17 @@ class SpeechmaticsClient:
                     except queue.Empty:
                         await asyncio.sleep(0.01)
                         continue
-                    if time.monotonic() - captured > 1:
+                    if not self.file_input and time.monotonic() - captured > 1:
                         self.frames.dropped += 1
                         continue
+                    if self.file_input:
+                        await asyncio.sleep(pacer.delay(len(frame) / 2 / OUTPUT_RATE))
                     payload = self._encode_audio(frame)
                     if payload:
                         await self._send_audio(client, payload)
+                    pacer.sent()
+                    if self.on_audio_sent:
+                        self.on_audio_sent(len(frame) // 2)
                 tail = self._flush_audio()
                 if tail:
                     await self._send_audio(client, tail)
@@ -367,6 +380,7 @@ class SpeechmaticsClient:
                     )
                     while not ended and not server_error:
                         await asyncio.sleep(0.01)
+                self.eos_received = bool(ended)
                 return
             except asyncio.CancelledError:
                 raise
