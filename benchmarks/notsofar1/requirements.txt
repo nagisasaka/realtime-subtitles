@@ -3,3 +3,4 @@
 meeteval==0.4.3
 regex==2026.9.29
 more-itertools==11.1.0
+simplejson==4.2.0 # MeetEval CLI JSON/Decimal reader

@@ -161,6 +161,26 @@ async def stream(
     }
 
 
+def check_sdk_config(client):
+    actual = {
+        "transcription": client._transcription_config.to_dict(),
+        "audio": client._audio_format.to_dict(),
+        "turn": client._turn_config.to_dict(),
+    }
+    expected = {
+        "language": "en",
+        "model": "linden-1",
+        "enable_partials": True,
+        "diarization": "speaker",
+        "emit_sentences": True,
+    }
+    if any(actual["transcription"].get(k) != v for k, v in expected.items()):
+        raise ValueError("Production Agent STT configuration changed; review benchmark first")
+    if actual["audio"] != {"type": "raw", "encoding": "pcm_s16le", "sample_rate": 16000}:
+        raise ValueError("Production SDK audio format changed")
+    return actual
+
+
 async def run(root, output, meeting_ids):
     key = os.environ.get("SPEECHMATICS_API_KEY", "").strip()
     if not key:
@@ -242,17 +262,12 @@ async def run(root, output, meeting_ids):
         recorder = Recorder(output, mid)
         # Reuse exact production SDK factory/config. Send already-16k audio directly:
         # no live app queue, reconnect/drop policy, capture, translation or resampling.
-        client = AgentSttClient()._new_sdk(key)
-        attempt["actual_sdk_config"] = {
-            "transcription": client._transcription_config.to_dict(),
-            "audio": client._audio_format.to_dict(),
-            "turn": client._turn_config.to_dict(),
-        }
-        if client._audio_format.to_dict()["sample_rate"] != 16000:
-            raise ValueError("Production SDK audio rate changed")
-        for kind in (*EVENTS, "Error"):
-            client.on(kind, recorder.receive)
+        client = None
         try:
+            client = AgentSttClient()._new_sdk(key)
+            attempt["actual_sdk_config"] = check_sdk_config(client)
+            for kind in (*EVENTS, "Error"):
+                client.on(kind, recorder.receive)
             async with asyncio.timeout(20):
                 await client.connect()
             recorder.session_id = client.session_id
@@ -271,9 +286,10 @@ async def run(root, output, meeting_ids):
         finally:
             attempt.update(session_id=recorder.session_id, event_counts=dict(recorder.counts))
             save(manifest_file, manifest)
-            with contextlib.suppress(Exception):
-                async with asyncio.timeout(3):
-                    await client.close()
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(3):
+                        await client.close()
             recorder.close()
         print("Completed", mid, recorder.final_count, "final segments", flush=True)
 

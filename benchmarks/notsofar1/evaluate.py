@@ -139,6 +139,7 @@ def score_meeting(reference, hypothesis, duration):
     tcp = meeteval.wer.tcpwer(ref, hyp, collar=5)[mid]
     tcorc = meeteval.wer.tcorcwer(ref, hyp, collar=5)[mid]
     errors = []
+    speaker_matches = Counter()
     # Retain both types: tcORC differences isolate text better than speaker-attributed TCP.
     pairs = [("tcpWER", tcp, reference, hypothesis, tcp.assignment)]
     orc_ref, orc_hyp = tcorc.apply_assignment(ref, hyp)
@@ -159,6 +160,11 @@ def score_meeting(reference, hypothesis, duration):
             hs = [h for h in hyp_rows if h["speaker"] == hyp_speaker]
             for r, h in align(rs, hs, collar=5, style="seglst"):
                 if r and h and r["words"] == h["words"]:
+                    if metric == "tcORC-WER":
+                        original = next(
+                            v for v in reference if v["utterance_id"] == r["utterance_id"]
+                        )
+                        speaker_matches[(original["speaker"], hyp_speaker)] += 1
                     continue
                 # tcORC assigned stream is NOT the person's GT identity.
                 original_ref = next(
@@ -195,6 +201,10 @@ def score_meeting(reference, hypothesis, duration):
         "gt_overlap_seconds": sum(hi - lo for lo, hi in overlap),
         "gt_speakers": len({r["speaker"] for r in reference}),
         "asr_speakers": len({r["speaker"] for r in hypothesis}),
+        "text_aligned_speaker_matches": [
+            {"gt_speaker": r, "asr_speaker": h, "matched_words": count}
+            for (r, h), count in speaker_matches.most_common()
+        ],
     }
     return result, errors
 

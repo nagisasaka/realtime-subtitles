@@ -358,3 +358,16 @@ def test_budget_and_duplicate_guards_before_api(tmp_path, monkeypatch, already_a
     with pytest.raises(ValueError):
         asyncio.run(runner.run(root, output, [mid]))
     assert not (output / "events.jsonl").exists()
+
+
+def test_production_sdk_configuration_is_pinned_without_connecting():
+    from benchmarks.notsofar1.run import check_sdk_config
+    from realtime_subtitles.agent_stt import AgentSttClient
+
+    sdk = AgentSttClient()._new_sdk("fixture-only")
+    actual = check_sdk_config(sdk)
+    assert actual["transcription"]["model"] == "linden-1"
+    assert actual["turn"] == {"turn_detection_mode": "vad"}
+    sdk._transcription_config.language = "ja"
+    with pytest.raises(ValueError):
+        check_sdk_config(sdk)

@@ -64,6 +64,23 @@ def report(output):
         lines.append(
             f"- {m['meeting_id']}: {ordinary.get('length', 0)}語 / {ordinary['seconds']:.1f}秒。"
         )
+    lines += ["", "話者対応の補助確認（tcORCで一致した語だけの対応数。DERではない）:", ""]
+    for m in meetings:
+        totals = {}
+        for row in m.get("text_aligned_speaker_matches", []):
+            totals[row["asr_speaker"]] = totals.get(row["asr_speaker"], 0) + row["matched_words"]
+        if totals:
+            label = max(totals, key=totals.get)
+            matches = [
+                f"{row['gt_speaker']}={row['matched_words']}語"
+                for row in m["text_aligned_speaker_matches"]
+                if row["asr_speaker"] == label
+            ]
+            lines.append(
+                f"- {m['meeting_id']}: 最多のASRラベル `{label}` は "
+                + ", ".join(matches)
+                + " に対応。"
+            )
     lines += ["", "各会議の録音・metadata:", ""]
     for m in meetings:
         source = next(x for x in manifest["meetings"] if x["meeting_id"] == m["meeting_id"])
