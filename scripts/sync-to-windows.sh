@@ -4,7 +4,7 @@ set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 target_dir="${1:-/mnt/c/workspace/realtime-subtitles}"
 mkdir -p "$target_dir"
-rsync -a --exclude='.venv/' --exclude='.venv-win/' --exclude='.git/' \
+rsync -a --exclude='.venv/' --exclude='.venv-*/' --exclude='.git' \
   --exclude='__pycache__/' --exclude='.pytest_cache/' --exclude='.ruff_cache/' \
   --exclude='build/' --exclude='dist/' --exclude='*.egg-info/' \
   --exclude='diagnostics/' --exclude='recordings/' --exclude='transcripts/' \
