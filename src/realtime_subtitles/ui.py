@@ -570,8 +570,18 @@ class SubtitleApp:
                 self.local_error = "Ctrl+Alt+F10を登録できないためClick-throughを有効にできません。"
         style = user.GetWindowLongW(hwnd, -20)
         user.SetWindowLongW(
-            hwnd, -20, (style | 0x20) if self.click_through.get() else (style & ~0x20)
+            hwnd, -20, (style | 0x80020) if self.click_through.get() else (style & ~0x20)
         )
+        if self.click_through.get():
+            # WS_EX_TRANSPARENT requires a layered window for hit-test passthrough,
+            # including when the user selected 100% opacity.
+            user.SetLayeredWindowAttributes.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_ubyte,
+                ctypes.c_uint,
+            ]
+            user.SetLayeredWindowAttributes(hwnd, 0, round(255 * self.root.attributes("-alpha")), 2)
         if not self.click_through.get() and self._hotkey:
             user.UnregisterHotKey(hwnd, 0x5342)
             user.SetWindowLongPtrW(hwnd, -4, self._original_proc)

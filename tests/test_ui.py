@@ -119,6 +119,8 @@ def test_controls_fonts_dpi_drag_clickthrough_and_missing_file(app, tmp_path):
     app._drag_move(SimpleNamespace(x_root=x + 25, y_root=y + 30))
     app.pump()
     assert abs(app.root.winfo_x() - (x + 15)) < 3
+    app.transparency.set(0)
+    app._transparency_changed(0)
     app.click_through.set(True)
     app._toggle_click_through()
     assert app.click_through.get() and app._hotkey
@@ -128,6 +130,7 @@ def test_controls_fonts_dpi_drag_clickthrough_and_missing_file(app, tmp_path):
     user = ctypes.windll.user32
     user.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
     hwnd = user.GetAncestor(app.root.winfo_id(), 2)
+    assert user.GetWindowLongW(hwnd, -20) & 0x80020 == 0x80020
     user.PostMessageW(hwnd, 0x312, 0x5342, 0)
     app.pump()
     assert not app.click_through.get()
