@@ -108,6 +108,16 @@ class LiveClient:
             except queue.Empty:
                 break
             if self.speechmatics.session_ready:
+                self.history.note_audio_frame(
+                    self.speechmatics.session_id,
+                    frame[0],
+                    len(frame[1]) // 2,
+                    healthy=not (
+                        self.mic.frames.dropped
+                        or self.speechmatics.frames.dropped
+                        or getattr(getattr(self.mic, "raw", None), "dropped", 0)
+                    ),
+                )
                 self.speechmatics.frames.put_latest(frame)
                 self.frames_dispatched += 1
 

@@ -25,6 +25,7 @@ class SourceSegment:
     received_monotonic_ms: int
     break_before: bool
     raw_event_json: str
+    estimated_audio_end_monotonic_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,9 @@ class TranslationUnit:
     end_to_end_ja_latency_ms: int | None = None
     latency_origin: str = "first_source_segment_received"
     queue_wait_ms: int | None = None
+    estimated_audio_end_monotonic_ms: int | None = None
+    audio_end_to_end_ja_latency_ms: int | None = None
+    audio_timing_basis: str = "unavailable"
 
     @property
     def unit_id(self):
@@ -67,6 +71,7 @@ class TranslationHistory:
         self._lock = threading.RLock()
         self._segments = []
         self._sources = []
+        self._audio_anchors = {}
         self.clock = clock
         self.word_metadata = []
         self._journal = []
@@ -96,6 +101,18 @@ class TranslationHistory:
                 self._partial, self._partial_speaker = text, speaker
                 self._revision += 1
 
+    def note_audio_frame(self, session_id, captured, samples, *, healthy=True):
+        """Estimate session audio origin from the first PCM capture-end timestamp.
+
+        Only valid while queues have no drops. Device/resampler latency is not measured;
+        this is explicitly an estimate, not the WebSocket receive clock.
+        """
+        with self._lock:
+            if not healthy:
+                self._audio_anchors[session_id] = None
+            elif session_id not in self._audio_anchors:
+                self._audio_anchors[session_id] = round((captured - samples / 24000) * 1000)
+
     def record_segment(self, event, session_id):
         """Persist and display final EN immediately, before assembly/translation."""
         if event.get("message") != "AddSegment":
@@ -116,6 +133,8 @@ class TranslationHistory:
             boundary = changed_session or bool(
                 self._last_speaker and known_speaker and self._last_speaker != known_speaker
             )
+            anchor = self._audio_anchors.get(session_id)
+            end_ms = milliseconds(meta.get("end_time"))
             segment = SourceSegment(
                 segment_id=len(self._sources),
                 en_text=text,
@@ -126,6 +145,9 @@ class TranslationHistory:
                 received_at=datetime.now(UTC).isoformat(),
                 received_monotonic_ms=round(self.clock() * 1000),
                 raw_event_json=json.dumps(event, ensure_ascii=False),
+                estimated_audio_end_monotonic_ms=(
+                    anchor + end_ms if anchor is not None and end_ms is not None else None
+                ),
                 break_before=boundary,
             )
             self._sources.append(segment)
@@ -160,6 +182,12 @@ class TranslationHistory:
                 assembler_hold_ms=max(0, now_ms - first.received_monotonic_ms),
                 assembled_monotonic_ms=now_ms,
                 assembly_reason=reason,
+                estimated_audio_end_monotonic_ms=last.estimated_audio_end_monotonic_ms,
+                audio_timing_basis=(
+                    "capture_sample_clock_estimate"
+                    if last.estimated_audio_end_monotonic_ms is not None
+                    else "unavailable"
+                ),
             )
             self._segments.append(unit)
             self._record(unit)
@@ -287,4 +315,23 @@ class TranslationHistory:
                 output.write(self.saved_text())
             else:
                 for segment in self.segments():
-                    output.write(json.dumps(asdict(segment), ensure_ascii=False) + "\n")
+                    output.write(
+                        json.dumps(
+                            {
+                                "kind": "translation_unit",
+                                "translation_unit_id": segment.unit_id,
+                                **asdict(segment),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                included = {i for s in self.segments() for i in s.source_segment_ids}
+                for source in self.sources():
+                    if source.segment_id not in included:
+                        output.write(
+                            json.dumps(
+                                {"kind": "raw_source_segment", **asdict(source)}, ensure_ascii=False
+                            )
+                            + "\n"
+                        )

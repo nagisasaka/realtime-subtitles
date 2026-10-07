@@ -566,8 +566,14 @@ class SubtitleApp:
                 elif segment.ja_text is not None:
                     parts.append(segment.ja_text)
                 else:
-                    pending = segment.translation_status in {"pending", "translating"}
-                    parts.append("［翻訳待ち…］" if pending else "［未翻訳］")
+                    pending = segment.translation_status in {"pending", "translating", "retrying"}
+                    parts.append(
+                        "［翻訳待ち…］"
+                        if pending
+                        else "［翻訳検証エラー］"
+                        if segment.translation_status == "validation_failed"
+                        else "［未翻訳］"
+                    )
             base = "".join(parts)
             suffix = (
                 ("\n\n" if base and partial_break else " " if base else "") + partial
