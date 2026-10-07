@@ -61,7 +61,8 @@ class TranslationUnitAssembler:
                     and 0 <= source.start_ms - previous.end_ms <= MAX_AUDIO_GAP_MS
                 )
                 same = (
-                    source.session_id == previous.session_id
+                    source.session_id is not None
+                    and source.session_id == previous.session_id
                     and source.speaker not in UNKNOWN_SPEAKERS
                     and source.speaker == previous.speaker
                 )

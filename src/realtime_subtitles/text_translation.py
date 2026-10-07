@@ -159,7 +159,9 @@ class TranslationWorker:
             validation_status = (
                 ("failed" if serious(issues) else "warning" if issues else "valid")
                 if final and any(c.get("text") is not None for c in candidates)
-                else "not_validated" if final else "pending"
+                else "not_validated"
+                if final
+                else "pending"
             )
             self.history.update_translation(
                 segment.sequence_id,

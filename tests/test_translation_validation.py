@@ -80,3 +80,26 @@ def test_context_leak_conservative_and_intentional_repetition_allowed():
 
 def test_source_language_characters_are_allowed_when_actually_quoted():
     assert not serious(TranslationValidator().validate("The name is తెలుగు.", "名前はతెలుగుです。"))
+
+
+@pytest.mark.parametrize(
+    ("en", "ja"),
+    [
+        ("2M tokens", "200万トークン"),
+        ("It weighs 2 pounds.", "重さは約907グラムです。"),
+        ("It takes 1:30.", "1分30秒かかります。"),
+        ("50 percent", "5割"),
+    ],
+)
+def test_ambiguous_conversions_only_warn(en, ja):
+    issues = TranslationValidator().validate(en, ja)
+    assert not any(i.severity == "error" for i in issues)
+
+
+def test_unicode_minus_and_explicit_currency_are_unambiguous():
+    v = TranslationValidator()
+    assert not v.validate("-20 meters", "−20メートル")
+    assert any(
+        i.code == "currency_mismatch" and i.severity == "error"
+        for i in v.validate("USD 2 million", "200万円")
+    )

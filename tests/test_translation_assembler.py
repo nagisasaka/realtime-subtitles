@@ -129,3 +129,11 @@ def test_safety_limits_and_unknown_speaker():
     feed("unknown", 32, 33, speaker="UU")
     feed("continuation.", 33, 34, speaker="UU")
     assert len(h.segments()) == 4
+
+
+def test_unknown_session_never_merges_even_with_matching_speaker():
+    clock, h, _, feed = harness()
+    feed("The landscape is", session=None)
+    clock.value += 0.4
+    feed("changing.", 1, 1.4, session=None)
+    assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]

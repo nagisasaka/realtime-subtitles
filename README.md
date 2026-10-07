@@ -9,7 +9,7 @@ Windows microphone (sounddevice、1デバイスのみ)
   → 16 kHzへ送信workerで変換（24 kHz PCMは別workerでWAV保存）
   → Speechmatics Agent STT linden-1 (en / partials / speaker / emit_sentences)
       ├─ Partial EN → 現在の未確定部分を置換表示
-      └─ AddSegment → TranslationUnit / sequence_id / speaker / start_ms / end_ms
+      └─ AddSegment → bounded Assembler → TranslationUnit / source_segment_ids / speaker / timestamps
                       → bounded queue → OpenAI Responses API × 最大4並列
                           gpt-6-luna / reasoning.effort=none
                       → 同じTranslationUnitのJA欄へ追加
@@ -95,11 +95,12 @@ PowerShellスクリプトが許可された環境では `scripts\run-windows.ps1
 - マウスホイール／上下キーで履歴を表示。End／「最新」で追従再開。
 - Clearは表示だけを消します。確定履歴や保存済みファイルは削除しません。
 - 薄い英語は置換可能なpartial。partialを翻訳APIへ送ることはありません。
-- 日本語の `［翻訳待ち…］` は対応finalを処理中、`［未翻訳］` は失敗・停止時キャンセル・queue上限です。
+- 日本語の `［翻訳待ち…］` は対応TranslationUnitを処理中、`［未翻訳］` は失敗・停止時キャンセル・queue上限です。
 - 未翻訳はStart中に設定画面の **未翻訳を再試行** から再要求できます。翻訳済みfinalは変更しません。
 
 設定は `%APPDATA%\RealtimeSubtitles\settings.json` に自動保存します。
 従来のOpenAI noise reduction設定は互換性のためファイルには残りますが、Speechmaticsには送らず設定UIでも非表示です。
+検証後も重大な異常が残った訳は `［翻訳検証エラー］` と表示し、候補文を正常訳として表示しません。
 Diagnosticsには入力デバイス、native rate、PCM形式、queue、Speechmatics状態、翻訳待ち数、並列数、翻訳モデル、自動保存先・エラーを表示します。
 
 ## 翻訳単位・文脈・話者
@@ -126,12 +127,72 @@ CONTEXTを再翻訳せずTARGETだけ自然な日本語へ訳すよう指示し�
 
 `sequence_id`はアプリ内で単調増加し、翻訳が先着した順に表示順を変えません。
 前の翻訳が遅くても、後の翻訳をその位置へ表示し、前の欄は届いた時点で更新します。
-EN/JAは同じfinalのspeaker・timestampを共有するので、時刻や文字列の類似度でalignmentを推測する必要はありません。
+JAは結合元ENのspeakerと先頭〜末尾の音声時刻を共有するので、時刻や文字列の類似度でalignmentを推測する必要はありません。
 
 前のTranslationUnitと次のTranslationUnitの既知speakerが変わると`break_before=true`にし、
 EN/JAに同じ空行を入れます。未知speaker（UU/SUなど）だけで話者交代を推定しません。
 speaker IDは接続をまたぐ人物IDではありません。session切り替わりも空行で区切ります。
 Agent STTのspeaker判定自体が誤る場合もあり、人物ごとの恒久IDや固定色は実装していません。
+
+## 翻訳検証と再翻訳
+
+Luna応答後にローカルの`TranslationValidator`を実行します。音声・Speechmatics・EN描画とは別workerです。
+数値と既知の通貨・単位を比較し、`$2 million`→`200万ドル`は許容、`200万トークン`への変更は重大な異常とします。
+整数・小数・英語のthousand/million/billion/trillion、日本語の百/千/万/億/兆、割合、既知の時間・長さ・重量を扱います。
+対応外の換算、漢数字、複合数量、曖昧な`2M`や重量にもなる`pounds`などは警告に留めます。
+制御文字、未知の文字種、明確な繰り返し、既に訳した長い文の混入も保守的に検査します。
+Kubernetes、MCP、Model Armor、mTLS等の英字技術用語は許容します。意味の正しさを全面的に保証する検査ではありません。
+
+重大なissueだけ、同じTARGET・同じCONTEXTへ検出内容の追加指示を付けて最大1回再翻訳します。
+API試行総数はネットワーク再試行も含め最大2回です。再試行後も重大なら`translation_status=validation_failed`。
+raw EN、最初の候補、最終候補、各候補の`validation_issues`を保持し、EN表示を続けます。
+軽い警告ならJAを表示し、`validation_status=warning`を保存します。ASR原文を自動訂正する機能ではありません。
+
+JSONL自動保存には、`raw_source_segment`と`translation_unit`を区別して記録します。
+unitには`translation_unit_id`、`source_segment_ids`、`raw_source_segments`、`en_text`、`ja_text`、
+`validation_status/issues`、`candidates`、`retry_count`、各処理の遅延を保存します。
+JSONLは更新journalなので、再構築時はunit IDごとの最後の状態を採用してID順に並べます。
+TXTと手動保存の最終unit一覧は発話順です。保留中のraw ENも保存対象です。
+
+遅延の定義:
+
+- `assembler_hold_ms`: 結合元の最初のAddSegment受信からunit確定まで。完結segmentは即時、未完結は設定上1500ms。実スレッドの約10msのtick・OS schedulingにより期限直後になる場合があります。
+- `translation_latency_ms`: API待機時間の合計。retry分を含み、queue待ち・assembler・検証は含みません。
+- `validation_latency_ms`: ローカル検証に要した時間の合計。
+- `queue_wait_ms`: unit確定から翻訳worker開始まで。
+- `end_to_end_ja_latency_ms`: **最初のAddSegment受信**からJAの確定／失敗判定まで。音声終了からの時間やTk描画完了時刻ではありません。
+- `audio_end_to_end_ja_latency_ms`: 最初のPCM capture終了時刻とsample数から推定したsession音声原点＋最後のsourceのend_msを基準とする推定値。デバイス／resampler遅延は未較正で、queue欠落が分かれば利用不可にします。
+
+## 結合・検証の動作確認（2026-10-07）
+
+Windows Python 3.14で既存講演WAVを合計75秒再生し、Start → Stop → Startを実行。
+新規マイク録音なし。Linden 1 → Luna → Tk表示で29 unitすべて確定、音声drop 0、Tkエラー0。
+この実行では全segmentが完結しており、結合・自然発生の品質retryはいずれも0件でした。
+自動テストはWSLで161件成功・Windows専用等6件skip、Windowsでアプリ関連141件成功。
+Windowsでは別環境のNOTSOFAR評価テストを除外し、native Tkの保留中EN表示・検証エラー表示も確認しました。
+Ruffと両環境の`pip check`も成功しています。
+
+| 計測値 | p50 | p95 | 最大 |
+|---|---:|---:|---:|
+| assembler保留 | 0ms | 0.6ms | 1ms |
+| Luna API | 1188ms | 2543ms | 3678ms |
+| ローカル検証 | 0.103ms | 0.485ms | 1.045ms |
+| unit queue待ち | 16ms | 32ms | 33ms |
+| 最初のAddSegment受信→JA確定 | 1218ms | 2558ms | 3688ms |
+
+保存済みの実際のAddSegmentを使う別の制御テストでは、元ログに受信時刻がないため**400ms間隔を指定**。
+同じLuna prompt・同じ直前5 raw ENの固定contextで、分割TARGETと結合TARGETを比較しました。
+
+- `The landscape is` / `changing.` → 1 unit、保留406ms、JA「状況は変化しています。」。
+  分割時は「状況は変化していて」「変化しているんです。」となり重複しました。
+- `Implement some sort of automated emails so you'll be able` / `to track.` → 1 unit、保留403ms、
+  JA「追跡できるように、自動メールを何らかの形で導入してください。」。`emails`を別のASR原文に訂正していません。
+- `$2 million`を「200万トークン」にした不正候補を注入する制御テストで`currency_mismatch`を検出。
+  再翻訳1回で「200万ドル」に修正され、実APIの追加待機は977msでした。これは自然発生retry率の測定ではありません。
+
+実測ログはWindowsコピーの`diagnostics/translation-quality/`（Git除外）にあります。
+29件で検証による拒否はありませんでしたが、広範なfalse positive率や意味の忠実性は未評価です。
+自然なsegment分割は同じ録音でも変わるため、この75秒から実運用の結合頻度は推定しません。
 
 ## スレッド・待ち行列・障害時
 
@@ -208,7 +269,7 @@ mainでは後追いdiarizationの30秒ring bufferは作りません。
 | 接続先 | データ・タイミング |
 | --- | --- |
 | `wss://global.rt.speechmatics.com/v2/agent` | Start時にAgent STT接続。16kHz PCMを継続送信、Stopで終了 |
-| `https://api.openai.com/v1/responses` | AddSegment受信ごとにTARGET＋直前最大5 TranslationUnitの英語を送信。`store=false`、最大4並列 |
+| `https://api.openai.com/v1/responses` | TranslationUnit確定ごとにTARGET＋直前最大5 TranslationUnitの英語を送信。重大な検証異常だけ最大1回再翻訳。`store=false`、最大4並列 |
 
 SpeechmaticsのTranslation bolt-onは使用しません。課金はSpeechmatics STTの接続音声時間と、
 Lunaの実際の入力（prompt/context含む）・出力tokensに依存するため、固定の1時間額ではありません。

@@ -76,7 +76,7 @@ class Quantity:
 
 
 def normalize(text):
-    return unicodedata.normalize("NFKC", text)
+    return unicodedata.normalize("NFKC", text).replace("−", "-")
 
 
 def quantities(text):
@@ -91,6 +91,9 @@ def quantities(text):
         for scale in SCALE_PATTERN.findall(match["scale"]):
             value *= SCALES[scale.lower()]
         unit = UNITS.get((match["currency"] or match["unit"] or "").lower())
+        # Bare "pounds" can mean weight, not currency. Never guess GBP from it.
+        if not match["currency"] and (match["unit"] or "").lower() in {"pound", "pounds"}:
+            unit = None
         if unit in CONVERSIONS:
             unit, multiplier = CONVERSIONS[unit]
             value *= multiplier
@@ -171,6 +174,9 @@ class TranslationValidator:
                     re.IGNORECASE,
                 )
             )
+            unsupported = unsupported or bool(
+                re.search(r"\d\s*[KMB]\b|\d+:\d+|(?i:\bpounds?\b|\blbs?\b)|割", target + output)
+            )
             if ev != jv:
                 severity = (
                     "error"
@@ -184,7 +190,7 @@ class TranslationValidator:
                 )
             if ev == jv:
                 for q in en:
-                    if q.unit and q.unit not in CURRENCIES and q not in ja:
+                    if q.unit and q.unit not in CURRENCIES and q not in ja and not unsupported:
                         add("unit_mismatch", "error", f"Preserve quantity unit {q.unit}.")
         # Unknown numerical syntax isn't guessed or silently repaired.
         sentences = [compact(x) for x in re.split(r"[。！？\n]", output) if len(compact(x)) >= 8]

@@ -559,3 +559,73 @@ def test_autosave_disk_failure_retries_final_updates_without_duplicates(tmp_path
         "pending",
         "completed",
     ]
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="Native Windows Tk")
+def test_held_final_is_visible_before_translation_and_validation_error_is_marked(tmp_path):
+    import tkinter as tk
+    from types import SimpleNamespace
+
+    from realtime_subtitles.translation_history import TranslationHistory
+    from realtime_subtitles.ui import SubtitleApp
+
+    now = [10.0]
+    history = TranslationHistory(clock=lambda: now[0])
+    client = LiveClient(history=history)
+    submitted = []
+    client.translation = SimpleNamespace(
+        submit=lambda u: submitted.append(u),
+        error="",
+        jobs=__import__("queue").Queue(),
+        in_flight=0,
+    )
+    root = tk.Tk()
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    app = SubtitleApp(
+        root, client=client, settings_file=tmp_path / "settings.json", device_loader=lambda: []
+    )
+
+    def pump():
+        until = time.monotonic() + 0.15
+        while time.monotonic() < until:
+            root.update()
+            time.sleep(0.01)
+
+    try:
+        first = history.record_segment(event("The landscape is", 0), "session")
+        client.assembler.accept(first)
+        pump()
+        assert not submitted and not history.segments()
+        assert "The landscape is" in app.en_text.get("1.0", "end-1c")
+        history.set_partial("changing", "S1")
+        pump()
+        assert app.en_text.get("1.0", "end-1c").endswith("changing")
+        now[0] += 0.4
+        second = history.record_segment(event("changing.", 1), "session")
+        history.set_partial("")
+        client.assembler.accept(second)
+        assert len(submitted) == 1
+        unit = submitted[0]
+        history.update_translation(
+            unit.sequence_id,
+            "validation_failed",
+            validation_status="failed",
+            candidates=({"text": "bad candidate"},),
+        )
+        pump()
+        assert "翻訳検証エラー" in app.ja_text.get("1.0", "end-1c")
+        assert "bad candidate" not in app.ja_text.get("1.0", "end-1c")
+        assert "changing." in app.en_text.get("1.0", "end-1c")
+        assert [s.en_text for s in history.sources()] == ["The landscape is", "changing."]
+        assert not errors
+    finally:
+        app.close()
+        until = time.monotonic() + 5
+        while app.autosave.active and time.monotonic() < until:
+            root.update()
+            time.sleep(0.02)
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
