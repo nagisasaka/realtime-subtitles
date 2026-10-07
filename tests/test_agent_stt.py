@@ -5,6 +5,7 @@ import wave
 from types import SimpleNamespace
 
 import numpy as np
+from conftest import make_unit
 
 from realtime_subtitles.agent_stt import AgentSttClient
 from realtime_subtitles.audio_recording import AudioRecorder
@@ -81,14 +82,15 @@ def test_agent_resampling_stream_duration_and_frequency():
 def test_unit_raw_word_journal_separation_and_duplicate_final(tmp_path):
     h = TranslationHistory()
     event = agent_event("The server owns this entire text.", 12.34, "S2")
-    unit = h.add_segment(event, "s")
+    unit = make_unit(h, event, "s")
     assert unit.start_ms == 12340 and unit.end_ms == 14340
     h.record_word_metadata({"message": "AddTranscript", "results": []}, "s")
-    assert h.add_segment(event, "s") is None
+    assert make_unit(h, event, "s") is None
     assert len(h.segments()) == 1
     h.update_translation(0, "completed", text="サーバーの文章。")
     journal, _ = h.autosave_updates(0)
     assert [x["kind"] for x in journal] == [
+        "raw_source_segment",
         "translation_unit",
         "raw_word_metadata",
         "translation_unit",

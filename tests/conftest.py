@@ -19,3 +19,12 @@ def isolated_audio_directory(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "realtime_subtitles.audio_recording.default_directory", lambda: tmp_path / "recordings"
     )
+
+
+def make_unit(history, event, session):
+    source = history.record_segment(event, session)
+    return (
+        history.emit_unit([source], "test_fixture", round(history.clock() * 1000))
+        if source
+        else None
+    )

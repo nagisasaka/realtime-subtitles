@@ -104,15 +104,20 @@ Diagnosticsには入力デバイス、native rate、PCM形式、queue、Speechma
 
 ## 翻訳単位・文脈・話者
 
-**AddSegment 1イベント = TranslationUnit 1件 = 翻訳TARGET 1件**です。
-`segment.transcript`全体をそのまま翻訳し、`segment.speaker`と`metadata.start_time/end_time`を保持します。
+**AddSegmentはraw確定ENとして即座に保存・表示し、TranslationUnitは別に組み立てます。**
+完結したsegmentは即時、未完結だけ最初の受信から最大1.5秒保留します。
+同session・既知の同speaker・音声gap 0〜600msの続きだけを結合します。
+話者/session変更・Stop/EOS/切断・期限でflushし、期限は延長しません。
+結合上限は2000文字・音声30秒・20segment。受信した単独segmentは上限超過でも切らずに即送信します。
+rawの`segment.transcript`を維持し、結合時は自然な単語間スペースでつなぎ、`segment.speaker`と`metadata.start_time/end_time`を保持します。
 `AddPartialSegment`は前のpartialを置換する英語ライブ表示専用です。
 `AddTranscript` / word / 低レベルfinalは翻訳のトリガーにしません。
-サーバーの`emit_sentences=true`で文境界を含むsegmentを受信し、クライアント独自の文分割・結合は行いません。
+サーバーの`emit_sentences=true`は維持し、不完全なsegmentのみ軽量Assemblerで短時間結合します。
 非推奨Realtime Voice SDKは使わず、`speechmatics-agent-stt`を使用します。
 
 直前最大5件のTranslationUnitの確定英語とspeakerをCONTEXTへ渡します。
-word metadataは別の履歴であり、context件数にもJA履歴にも数えません。
+raw source segment・word metadataは別の履歴であり、context件数には数えません。
+`source_segment_ids`と`raw_source_segments`から結合前の確定ENを復元できます。
 今回のTARGETや以前の日本語訳はCONTEXTに含めません。
 認識sessionをまたぐ文脈は混ぜません。固有名詞、数値、否定、比較、金額、単位、技術用語を維持し、
 CONTEXTを再翻訳せずTARGETだけ自然な日本語へ訳すよう指示しています。

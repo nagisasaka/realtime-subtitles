@@ -557,7 +557,8 @@ class SubtitleApp:
             self._update_follow_button()
         for lang, widget in self.caption_widgets.items():
             parts = []
-            for segment in segments:
+            items = self.client.history.english_display() if lang == "en" else segments
+            for segment in items:
                 if parts:
                     parts.append("\n\n" if segment.break_before else " ")
                 if lang == "en":

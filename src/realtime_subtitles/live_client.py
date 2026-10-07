@@ -10,6 +10,7 @@ from .audio import Microphone
 from .audio_recording import AudioRecorder
 from .realtime_api import State
 from .text_translation import TranslationWorker
+from .translation_assembler import TranslationUnitAssembler
 from .translation_history import TranslationHistory
 
 
@@ -27,6 +28,7 @@ class LiveClient:
         self.recorder_factory = recorder_factory
         self.recorder = None
         self.recording_error = ""
+        self.assembler = TranslationUnitAssembler(self._emit_unit, clock=self.history.clock)
         self.microphone_factory = microphone_factory
         self.speechmatics_factory = speechmatics_factory
         self.translation_factory = translation_factory
@@ -58,7 +60,15 @@ class LiveClient:
         self.thread.start()
         return True
 
+    def _emit_unit(self, sources, reason, now_ms):
+        unit = self.history.emit_unit(sources, reason, now_ms)
+        if self.translation:
+            self.translation.submit(unit)
+        else:
+            self.history.update_translation(unit.sequence_id, "cancelled")
+
     def _session_changed(self, identity):
+        self.assembler.flush("session_change_or_eos")
         self.history.set_partial("")
 
     def _receive(self, event, words):
@@ -69,15 +79,18 @@ class LiveClient:
             if isinstance(text, str):
                 self.history.set_partial(text, segment.get("speaker"))
         elif event.get("message") == "AddSegment":
-            unit = self.history.add_segment(event, sm.session_id)
-            if unit is not None:
+            source = self.history.record_segment(event, sm.session_id)
+            if source is not None:
                 self.history.set_partial("")
-                self.translation.submit(unit)
+                self.assembler.accept(source)
+                if self.stop_requested.is_set():
+                    self.assembler.flush("stopping")
         elif event.get("message") == "AddTranscript":
             self.history.record_word_metadata(event, sm.session_id)
 
     def stop(self):
         self.stop_requested.set()
+        self.assembler.flush("stop")
         if self.active:
             self.state = State.STOPPING
             if self.speechmatics and not self.speechmatics.session_ready:
@@ -130,6 +143,7 @@ class LiveClient:
             self.mic.start()
             while not self.stop_requested.is_set():
                 self.mic.check_health()
+                self.assembler.tick()
                 self._dispatch()
                 if not self.speechmatics.active:
                     raise RuntimeError("Speechmatics stopped")
@@ -144,6 +158,7 @@ class LiveClient:
             )
         finally:
             self.state = State.STOPPING
+            self.assembler.flush("stopping")
             try:
                 if self.mic:
                     self.mic.stop()
@@ -165,6 +180,7 @@ class LiveClient:
                     self.recorder.close()
                 except Exception as exc:
                     self.recording_error = type(exc).__name__
+            self.assembler.flush("eos")
             # EOS may emit additional finals; only now stop accepting translation jobs.
             if self.translation:
                 self.translation.finish()
@@ -196,6 +212,7 @@ class LiveClient:
             "reasoning_effort": "none",
             "speechmatics": sm,
             "translation_status": counts,
+            "assembler": self.assembler.snapshot(),
             "translation_queue": self.translation.jobs.qsize() if self.translation else 0,
             "translations_in_flight": self.translation.in_flight if self.translation else 0,
             "frames_dispatched": self.frames_dispatched,

@@ -25,12 +25,15 @@ def console(args):
         updates, metadata = client.history.autosave_updates(cursor)
         cursor += len(updates)
         for record in updates:
+            if record.get("kind") == "raw_source_segment":
+                print(f"EN source #{record['segment_id']}: {record['en_text']}", flush=True)
+                continue
             if record.get("kind") != "translation_unit":
                 continue  # Raw word metadata is never subtitle text or a translation trigger.
             sequence = record["sequence_id"]
             if sequence not in seen:
                 print(
-                    f"EN #{sequence} [{record['speaker']} "
+                    f"Translation unit #{sequence} [{record['speaker']} "
                     f"{record['start_ms']}–{record['end_ms']} ms]: {record['en_text']}",
                     flush=True,
                 )

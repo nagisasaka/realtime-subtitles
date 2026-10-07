@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from conftest import make_unit
 from test_realtime_api import SyntheticMicrophone, until
 from websockets.asyncio.server import serve
 
@@ -44,9 +45,9 @@ def wait_for(predicate):
 def test_final_unit_context_speakers_and_authoritative_text():
     h = FinalHistory()
     for i in range(7):
-        segment = h.add_segment(event(f"Fragment {i} without punctuation ", i), "a")
-    target = h.add_segment(
-        event("First sentence. Second sentence without punctuation", 7, "S2"), "a"
+        segment = make_unit(h, event(f"Fragment {i} without punctuation ", i), "a")
+    target = make_unit(
+        h, event("First sentence. Second sentence without punctuation", 7, "S2"), "a"
     )
     assert target.sequence_id == 7 and target.break_before
     assert target.en_text == "First sentence. Second sentence without punctuation"
@@ -55,8 +56,8 @@ def test_final_unit_context_speakers_and_authoritative_text():
         f"Fragment {i} without punctuation " for i in range(2, 7)
     ]
     assert len(h.segments()) == 8 and not segment.break_before
-    assert h.add_segment(event(target.en_text, 7, "S2"), "a") is None
-    new = h.add_segment(event(target.en_text, 7, "S2"), "b")
+    assert make_unit(h, event(target.en_text, 7, "S2"), "a") is None
+    new = make_unit(h, event(target.en_text, 7, "S2"), "b")
     assert new.sequence_id == 8 and h.context_for(8) == []
     assert new.break_before
     h.update_translation(7, "completed", text="一文目。二文目の断片")
@@ -76,7 +77,7 @@ def test_only_final_triggers_translation_partial_replaces():
         client._receive(e, words)
     assert not jobs
     assert client.history.display_snapshot()[3] == "The biggest challenge is reliability"
-    final = event("The biggest challenge is reliability")
+    final = event("The biggest challenge is reliability.")
     for _ in range(2):
         client._receive(final, ())
     assert len(jobs) == 1 and jobs[0].en_text == final["segment"]["transcript"]
@@ -87,8 +88,8 @@ def test_only_final_triggers_translation_partial_replaces():
 
 def test_raw_words_never_split_or_override_agent_segment():
     h = FinalHistory()
-    h.add_segment(event("First.", 0, "S1"), "s")
-    unknown = h.add_segment(event("Unknown.", 1, "UU"), "s")
+    make_unit(h, event("First.", 0, "S1"), "s")
+    unknown = make_unit(h, event("Unknown.", 1, "UU"), "s")
     assert unknown.speaker == "UU" and not unknown.break_before
     mixed = event("Hello there.", 2)
     mixed["results"] = [
@@ -105,12 +106,12 @@ def test_raw_words_never_split_or_override_agent_segment():
             "alternatives": [{"content": "there.", "speaker": "S2"}],
         },
     ]
-    result = h.add_segment(mixed, "s")
+    result = make_unit(h, mixed, "s")
     assert len(h.segments()) == 3 and result.en_text == "Hello there."
     assert not hasattr(result, "words")
     assert result.speaker == "S1"
-    assert h.add_segment(event("Continue.", 3, "S2"), "s").break_before
-    assert h.add_segment(event("Changed.", 4, "S1"), "s").break_before
+    assert make_unit(h, event("Continue.", 3, "S2"), "s").break_before
+    assert make_unit(h, event("Changed.", 4, "S1"), "s").break_before
 
 
 def test_parallel_translation_keeps_sequence_context_and_bounds():
@@ -141,7 +142,7 @@ def test_parallel_translation_keeps_sequence_context_and_bounds():
     worker.start()
     try:
         for i in range(8):
-            worker.submit(history.add_segment(event(f"English {i} ", i), "s"))
+            worker.submit(make_unit(history, event(f"English {i} ", i), "s"))
         wait_for(lambda: history.statistics().get("completed") == 8)
     finally:
         worker.finish()
@@ -169,12 +170,12 @@ def test_queue_limit_preserves_english_and_stop_cancels_inflight():
     worker = TranslationWorker(
         h, "test", translator_factory=Slow, concurrency=1, queue_size=1, stop_drain=0.05
     )
-    worker.submit(h.add_segment(event("first", 0), "s"))
-    assert not worker.submit(h.add_segment(event("overflow", 1), "s"))
+    worker.submit(make_unit(h, event("first", 0), "s"))
+    assert not worker.submit(make_unit(h, event("overflow", 1), "s"))
     assert h.segments()[1].translation_status == "skipped"
     worker.start()
     assert entered.wait(2)
-    worker.submit(h.add_segment(event("queued", 2), "s"))
+    worker.submit(make_unit(h, event("queued", 2), "s"))
     worker.finish()
     assert worker.join(2)
     assert h.statistics() == {"cancelled": 2, "skipped": 1}
@@ -220,7 +221,7 @@ def test_sdk_responses_schema_target_only_and_no_temperature():
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
         h = FinalHistory()
-        target = h.add_segment(event("Translate only this final", 2), "s")
+        target = make_unit(h, event("Translate only this final", 2), "s")
         try:
             text, _ = await translator.translate(
                 target, [{"speaker": "S1", "text": "Earlier context"}]
@@ -257,7 +258,7 @@ def test_translation_http_error_does_not_erase_finals_or_leak_secret():
     worker.start()
     try:
         for i in range(2):
-            worker.submit(h.add_segment(event(f"English {i}", i), "s"))
+            worker.submit(make_unit(h, event(f"English {i}", i), "s"))
         wait_for(lambda: h.statistics().get("failed") == 2)
     finally:
         worker.finish()
@@ -268,8 +269,8 @@ def test_translation_http_error_does_not_erase_finals_or_leak_secret():
 
 def test_autosave_updates_out_of_order_translations_and_clear(tmp_path):
     h = FinalHistory()
-    first = h.add_segment(event("Question?", 0), "s")
-    second = h.add_segment(event("Answer.", 1, "S2"), "s")
+    first = make_unit(h, event("Question?", 0), "s")
+    second = make_unit(h, event("Answer.", 1, "S2"), "s")
     save = TranscriptAutosave({"subtitles": h}, tmp_path)
     try:
         h.update_translation(second.sequence_id, "completed", text="答え。")
@@ -280,7 +281,7 @@ def test_autosave_updates_out_of_order_translations_and_clear(tmp_path):
     latest = {}
     for line in (save.directory / "subtitles.jsonl").read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
-        if row["kind"] == "transcript":
+        if row["kind"] == "transcript" and row["record"]["kind"] == "translation_unit":
             record = row["record"]
             latest[record["sequence_id"]] = record
     assert latest[0]["ja_text"] == "質問？" and latest[1]["ja_text"] == "答え。"
@@ -435,9 +436,9 @@ def test_overlay_final_translation_replacement_and_scroll(tmp_path):
         pump()
         assert app.en_text.get("1.0", "end-1c") == "The biggest challenge"
         assert app.en_text.tag_ranges("partial")
-        first = client.history.add_segment(event("The biggest challenge", 0), "s")
+        first = make_unit(client.history, event("The biggest challenge", 0), "s")
         client.history.set_partial("")
-        second = client.history.add_segment(event("Next speaker.", 1, "S2"), "s")
+        second = make_unit(client.history, event("Next speaker.", 1, "S2"), "s")
         client.history.update_translation(second.sequence_id, "completed", text="次の話者。")
         pump()
         assert app.ja_text.get("1.0", "end-1c") == "［翻訳待ち…］\n\n次の話者。"
@@ -446,7 +447,7 @@ def test_overlay_final_translation_replacement_and_scroll(tmp_path):
         assert app.ja_text.get("1.0", "end-1c") == "最大の課題\n\n次の話者。"
         assert not app.en_text.tag_ranges("partial")
         for i in range(2, 70):
-            s = client.history.add_segment(event(f"Line {i}.\n", i), "s")
+            s = make_unit(client.history, event(f"Line {i}.\n", i), "s")
             if i > 2:
                 client.history.update_translation(s.sequence_id, "completed", text=f"行{i}。\n")
         pump()
@@ -494,10 +495,10 @@ def test_translation_retry_is_bounded_and_stop_interrupts_retry_sleep():
     worker = TranslationWorker(h, "test", translator_factory=RateLimited, stop_drain=0.01)
     worker.start()
     try:
-        worker.submit(h.add_segment(event("one"), "s"))
+        worker.submit(make_unit(h, event("one"), "s"))
         wait_for(lambda: h.statistics().get("failed") == 1)
         assert calls == [0, 0]
-        worker.submit(h.add_segment(event("two", 1), "s"))
+        worker.submit(make_unit(h, event("two", 1), "s"))
         wait_for(lambda: len(calls) == 3)
     finally:
         worker.finish()
@@ -535,14 +536,14 @@ def test_autosave_disk_failure_retries_final_updates_without_duplicates(tmp_path
 
     monkeypatch.setattr(TranscriptAutosave, "_append", unavailable)
     h = FinalHistory()
-    h.add_segment(event("Original English"), "s")
+    make_unit(h, event("Original English"), "s")
     save = TranscriptAutosave({"subtitles": h}, tmp_path)
     try:
         wait_for(lambda: bool(save.error))
         assert "private-details" not in save.error
         h.update_translation(0, "completed", text="日本語。")
         allowed.set()
-        wait_for(lambda: save.cursors["subtitles"] == 2)
+        wait_for(lambda: save.cursors["subtitles"] == 3)
     finally:
         allowed.set()
         assert save.close()
@@ -550,7 +551,11 @@ def test_autosave_disk_failure_retries_final_updates_without_duplicates(tmp_path
         json.loads(line)
         for line in (save.directory / "subtitles.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert [r["record"]["translation_status"] for r in records if r["kind"] == "transcript"] == [
+    assert [
+        r["record"]["translation_status"]
+        for r in records
+        if r["kind"] == "transcript" and r["record"]["kind"] == "translation_unit"
+    ] == [
         "pending",
         "completed",
     ]
