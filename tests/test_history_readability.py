@@ -267,3 +267,106 @@ def test_resume_retains_invocation_and_cached_calls(tmp_path):
         assert result["status"] == "incomplete" and len(calls) == 2
 
     asyncio.run(run())
+
+
+def test_cross_version_comparison_verifies_actual_inputs_and_provenance():
+    from benchmarks.history_readability.compare_saved import checked_windows
+
+    old = {
+        "source_hashes": {"events.jsonl": "fixed"},
+        "windows": [
+            {
+                "id": "w",
+                "english": "Original English.",
+                "context": [],
+                "raw_sources": [
+                    {
+                        "en_text": "Original English.",
+                        "received_at": "old replay",
+                        "received_monotonic_ms": 42,
+                    }
+                ],
+            }
+        ],
+    }
+    new = deepcopy(old)
+    new["windows"][0]["raw_sources"][0]["received_at"] = "new replay"
+    new["pipeline"] = "split_then_batch_translate_v1"
+
+    def output(manifest):
+        return {"inputs": {"manifest_hash": digest(manifest)}, "results": {"w": {}}}
+
+    assert len(checked_windows(old, new, output(old), output(new))) == 1
+    for key, value in [("english", "Changed English"), ("context", [{"text": "different"}])]:
+        changed = deepcopy(new)
+        changed["windows"][0][key] = value
+        with pytest.raises(ValueError, match="inputs"):
+            checked_windows(old, changed, output(old), output(changed))
+    changed = deepcopy(new)
+    changed["windows"][0]["raw_sources"][0]["received_monotonic_ms"] = 43
+    with pytest.raises(ValueError, match="inputs"):
+        checked_windows(old, changed, output(old), output(changed))
+    with pytest.raises(ValueError, match="manifest"):
+        checked_windows(old, new, output(new), output(new))
+    changed = deepcopy(new)
+    changed["source_hashes"]["events.jsonl"] = "different"
+    with pytest.raises(ValueError, match="hashes"):
+        checked_windows(old, changed, output(old), output(changed))
+    with pytest.raises(ValueError, match="missing"):
+        checked_windows(old, new, {"inputs": output(old)["inputs"], "results": {}}, output(new))
+
+
+def test_saved_comparison_retains_manifests_and_marks_rejected_drafts(tmp_path):
+    from benchmarks.history_readability.compare_saved import compare
+    from benchmarks.history_readability.prepare import read_json, write_json
+
+    old_manifest = {"source_hashes": {}, "windows": [{"id": "w", "english": "Yes.", "context": []}]}
+    new_manifest = dict(old_manifest, pipeline="new")
+    paragraph = {"en": "Yes.", "ja": "はい。", "en_start": 0, "en_end": 4}
+    old = {
+        "inputs": {"manifest_hash": digest(old_manifest)},
+        "results": {"w": {"status": "structural_failure", "paragraphs": [paragraph]}},
+    }
+    new = {
+        "inputs": {"manifest_hash": digest(new_manifest)},
+        "results": {"w": {"status": "valid", "paragraphs": [paragraph]}},
+    }
+    for name, value in [
+        ("old_manifest", old_manifest),
+        ("manifest", new_manifest),
+        ("old", old),
+        ("current", new),
+    ]:
+        write_json(tmp_path / (name + ".json"), value)
+    args = SimpleNamespace(
+        **{k: tmp_path / (k + ".json") for k in ["old_manifest", "manifest", "old", "current"]},
+        directory=tmp_path,
+        output=tmp_path / "comparison.json",
+        ids=None,
+        reverse=False,
+        seconds=30,
+    )
+    requests = []
+
+    async def parse(**kwargs):
+        requests.append(kwargs)
+        empty = {
+            "boundaries": [],
+            "major_translation_errors": [],
+            "alignment_errors": [],
+            "overmerging": [],
+        }
+        verdict = Verdict(
+            A=empty, B=empty, readability="tie", fidelity="tie", alignment="tie", reason="x"
+        )
+        return SimpleNamespace(
+            status="completed", output_parsed=verdict, usage=None, model_dump=lambda **kw: {}
+        )
+
+    result = asyncio.run(compare(args, SimpleNamespace(responses=SimpleNamespace(parse=parse))))
+    assert len(requests) == 1
+    assert result["comparison_status"] == "finished"
+    assert result["judgments"]["w"]["draft_only"] is True
+    assert read_json(args.old) == old and read_json(args.current) == new
+    assert result["inputs"]["manifest_hash"] == digest(new_manifest)
+    assert result["comparison"]["historical_manifest_hash"] == digest(old_manifest)

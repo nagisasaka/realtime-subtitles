@@ -92,3 +92,27 @@ python -m benchmarks.history_readability.preview `
 稼働アプリ・設定・マイク・APIには触れない。`preview.py` はWindows専用。
 
 [2026-10-08の採否](../../docs/history-readability-results.md)：最大3候補を検証し、現行維持。
+
+## 異なる実装の保存結果を比較する
+
+`compare_saved` は旧新それぞれのmanifestとrunのhashを検査し、本文/context/speaker/音声時刻/source hashが一致する場合だけ匿名採点する。
+local replay時に変化する `raw_sources.received_at` だけを比較から除外する。旧runのmanifest hashを新runへ付け替えない。
+旧方式が棄却したdraftを比較する場合は `draft_only` を残し、双方が成功した窓とは別集計する。
+生成をやり直さず、同じ評価directoryのledger/cache・排他lockを使用する。
+
+```bash
+.venv/bin/python -m benchmarks.history_readability.compare_saved \
+  --old-manifest benchmark_results/history_readability/run1/manifest.json \
+  --old benchmark_results/history_readability/run1/baseline/dev.json \
+  --manifest benchmark_results/history_readability/two_stage_20261008/manifest.json \
+  --current benchmark_results/history_readability/two_stage_20261008/current/dev.json \
+  --directory benchmark_results/history_readability/two_stage_20261008 \
+  --output benchmark_results/history_readability/two_stage_20261008/comparison.json
+```
+
+上の例の新manifestは、同じsourceと旧 `run1/anchors.json` を `prepare --anchors` に指定して作成した。
+新出力は `run --name current` と `run --name current --split holdout` で取得できる。
+生成の再現確認は `run --name repeat --ids 4474955-r5 4474955-r13 --nonce repeat1`、
+採点の提示順確認は `compare_saved --ids 4474955-r5 4474955-r13 --reverse` を別outputへ保存する。
+
+[今回の英文先行分割方式の評価](../../docs/history-two-stage-evaluation.md)：構造成功率は向上したが、分断の悪化例が再現。プロンプト変更なし。
