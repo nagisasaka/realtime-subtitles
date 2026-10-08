@@ -220,6 +220,7 @@ class TranslationHistory:
                 ),
             )
             self._segments.append(unit)
+            self.reconstructions.add_unit(unit)
             self._status_counts["pending"] = self._status_counts.get("pending", 0) + 1
             self._record(unit)
             return unit
@@ -282,6 +283,7 @@ class TranslationHistory:
                 **metadata,
             )
             self._segments[sequence_id] = new
+            self.reconstructions.update_original(new)
             self._status_counts[old.translation_status] -= 1
             self._status_counts[status] = self._status_counts.get(status, 0) + 1
             self._record(new)
@@ -356,25 +358,27 @@ class TranslationHistory:
 
     def saved_text(self):
         parts = []
-        for s, original_ids in self.reconstructions.effective_units():
-            if s.break_before:
+        # Capture one revision: the autosave worker must not see a new block
+        # whose original unit arrived after its unit snapshot.
+        with self._lock:
+            units = tuple(self._segments)
+            sources = tuple(self._sources)
+            blocks = self.reconstructions.effective_blocks()
+        for block in blocks:
+            first, last = units[block.start[0]], units[block.end[0]]
+            if block.break_before:
                 parts.append("\n---\n")
-            if original_ids:
-                parts.append(f"[reconstructed units {','.join(map(str, original_ids))}]\n")
-            parts.append(f"[#{s.sequence_id} {s.start_ms}–{s.end_ms} ms / {s.session_id}]\n")
-            paragraphs = self.reconstructions.paragraphs_for(s.unit_id) if original_ids else ()
-            if paragraphs:
-                for paragraph in paragraphs:
-                    parts.append(
-                        f"EN: {s.en_text[paragraph.en_start : paragraph.en_end]}\n"
-                        f"JA: {paragraph.ja_text}\n"
-                    )
-            else:
-                parts.append(
-                    f"EN: {s.en_text}\nJA: {s.ja_text or '[' + s.translation_status + ']'}\n"
-                )
-        included = {i for s in self.segments() for i in s.source_segment_ids}
-        for source in self.sources():
+            if block.revision_id >= 0:
+                ids = dict.fromkeys(run[0] for run in block.source_runs)
+                parts.append(f"[reconstructed units {','.join(map(str, ids))}]\n")
+            parts.append(
+                f"[{block.key} source units {block.start}–{block.end} / "
+                f"{first.start_ms}–{last.end_ms} ms (unit bounds) / {first.session_id}]\n"
+                f"EN: {block.en_text}\n"
+                f"JA: {block.ja_text or '[' + block.translation_status + ']'}\n"
+            )
+        included = {i for s in units for i in s.source_segment_ids}
+        for source in sources:
             if source.segment_id not in included:
                 parts.append(f"[source #{source.segment_id} / holding]\nEN: {source.en_text}\n")
         return "\n".join(parts)

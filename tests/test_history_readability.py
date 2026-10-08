@@ -29,13 +29,13 @@ def test_replay_uses_production_pairs_context_and_immutable_raw():
     original = deepcopy(rows)
     a = replay(rows)
     assert rows == original
-    assert len(a) == 2
-    assert a[0]["english"] == " ".join(f"Source {i}." for i in range(6))
-    assert a[0]["source_ids"] == tuple(range(6))
+    assert len(a) == 5
+    assert a[0]["english"] == " ".join(f"Source {i}." for i in range(4))
+    assert a[0]["source_ids"] == tuple(range(4))
     assert a[1]["context"] == [
-        {"speaker": "S1", "text": f"Source {i}. Source {i + 1}."} for i in range(0, 6, 2)
+        {"speaker": "S1", "text": f"Source {i}. Source {i + 1}."} for i in range(0, 2, 2)
     ]
-    assert len(a[0]["raw_sources"]) == 6
+    assert len(a[0]["raw_sources"]) == 4
 
 
 def test_partial_speaker_change_flushes_and_unknown_not_joined():
@@ -370,3 +370,37 @@ def test_saved_comparison_retains_manifests_and_marks_rejected_drafts(tmp_path):
     assert read_json(args.old) == old and read_json(args.current) == new
     assert result["inputs"]["manifest_hash"] == digest(new_manifest)
     assert result["comparison"]["historical_manifest_hash"] == digest(old_manifest)
+
+
+def test_tail_eval_replay_and_seed_keep_original_raw_sources():
+    from benchmarks.history_readability.tail_review import add_saved_unit, seed, source_histories
+    from realtime_subtitles.translation_history import TranslationHistory
+
+    rows = [event(f"Source {i}.", i) for i in range(8)] + [event("", 8, kind="EndOfTranscript")]
+    originals = deepcopy(rows)
+    source = source_histories(rows)["s"]
+    assert rows == originals and len(source.segments()) == 4
+    h = TranslationHistory()
+    for unit in source.segments()[:3]:
+        add_saved_unit(h, unit)
+    english = " ".join(u.en_text for u in h.segments())
+    cut = english.index("Source 5.")
+    w = {"unit_ids": [0, 1, 2], "english": english}
+    result = {
+        "status": "valid",
+        "chunks": [
+            {"id": 0, "en_start": 0, "en_end": cut - 1},
+            {"id": 1, "en_start": cut, "en_end": len(english)},
+        ],
+        "paragraphs": [
+            {"en_start": 0, "en_end": cut - 1, "ja": "前半"},
+            {"en_start": cut, "en_end": len(english), "ja": "最後"},
+        ],
+    }
+    seed(h, w, result)
+    assert len(h.sources()) == 6
+    target = h.reconstructions.plan(add_saved_unit(h, source.segments()[3]))
+    assert target.en_text == "Source 5. Source 6. Source 7."
+    assert h.reconstructions.effective_blocks()[0].ja_text == "前半"
+    with pytest.raises(ValueError, match="EOS"):
+        source_histories(rows[:-1])

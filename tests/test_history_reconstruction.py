@@ -89,18 +89,30 @@ def test_clear_and_length_limit():
     assert h.reconstructions.plan(add(h, "continuation.")) is None
 
 
-def test_extend_at_most_three_units_and_out_of_order_results():
+def complete(h, target, texts, japanese=None):
+    paragraphs, offset = [], 0
+    for i, text in enumerate(texts):
+        start = target.en_text.index(text, offset)
+        end = start + len(text)
+        paragraphs.append(ReconstructedParagraph(start, end, japanese[i] if japanese else f"訳{i}"))
+        offset = end
+    h.reconstructions.set_paragraphs(target.unit_id, tuple(paragraphs))
+    h.reconstructions.update_translation(
+        target.unit_id, "completed", text="\n\n".join(p.ja_text for p in paragraphs)
+    )
+
+
+def test_out_of_order_overlapping_response_cannot_erase_newer_paragraph():
     h = TranslationHistory()
-    add(h, "The landscape is")
-    a = h.reconstructions.plan(add(h, "changing and"))
-    b = h.reconstructions.plan(add(h, "the reason is"))
-    assert a.unit_id == 0 and b.unit_id == 1
-    assert h.reconstructions.plan(add(h, "a new capability.")) is None
-    h.reconstructions.update_translation(1, "completed", text="新しいまとまり。")
-    h.reconstructions.update_translation(0, "completed", text="古い短いまとまり。")
-    effective = h.reconstructions.effective_units()
-    assert len(effective) == 2 and effective[0][1] == (0, 1, 2)
-    assert effective[0][0].ja_text == "新しいまとまり。"
+    add(h, "First sentence.")
+    a = h.reconstructions.plan(add(h, "Second sentence."))
+    b = h.reconstructions.plan(add(h, "Third sentence."))
+    complete(h, b, [b.en_text], ["新しいまとまり。"])
+    complete(h, a, [a.en_text], ["遅い古い訳。"])
+    blocks = h.reconstructions.effective_blocks()
+    assert [b.en_text for b in blocks] == ["First sentence.", "Second sentence. Third sentence."]
+    assert blocks[1].ja_text == "新しいまとまり。"
+    assert not h.reconstructions.entries()[0].applied
 
 
 def test_revision_validator_failure_retains_originals_and_both_candidates():
@@ -120,7 +132,7 @@ def test_revision_validator_failure_retains_originals_and_both_candidates():
     assert len(calls) == 2
     assert revision.translation.translation_status == "validation_failed"
     assert len(revision.translation.candidates) == 2
-    assert [u.en_text for u, _ in h.reconstructions.effective_units()] == [
+    assert [u.en_text for u in h.reconstructions.effective_blocks()] == [
         "The price is",
         "$2 million.",
     ]
@@ -178,14 +190,14 @@ def test_split_before_translation_and_ids_restore_order_without_rewriting_source
     h.update_translation(0, "completed", text="状況は……")
     target = h.reconstructions.plan(add(h, "changing. Reliability matters."))
     original = [asdict(u) for u in h.segments()]
-    context = [{"speaker": "S1", "text": "An earlier thought."}]
+    context = h.reconstructions.context_for(target.unit_id)
     translation = batch("状況は変化しています。", "信頼性が重要です。")
     translation["translations"].reverse()
 
     def observer(call):
         revision = h.reconstructions.entries()[0]
         assert revision.translation.translation_status != "completed"
-        assert len(h.reconstructions.effective_units()) == 2
+        assert len(h.reconstructions.effective_blocks()) == 2
         if call == 2:
             assert len(revision.chunks) == 2  # Fixed before any Japanese is requested.
             assert not revision.paragraphs
@@ -289,7 +301,7 @@ def test_retry_translates_only_frozen_chunks_and_preserves_candidates(valid_retr
         "completed" if valid_retry else "validation_failed"
     )
     if not valid_retry:
-        assert len(h.reconstructions.effective_units()) == 2
+        assert len(h.reconstructions.effective_blocks()) == 2
     assert h.segments()[1].en_text == "$2 million."
     with pytest.raises(ValueError, match="fixed"):
         h.reconstructions.set_chunks(
@@ -326,7 +338,7 @@ def test_structural_failure_retains_originals(outputs, expected_calls):
     revision = h.reconstructions.entries()[0]
     assert revision.translation.translation_status == "failed"
     assert "sensitive" not in revision.translation.translation_error
-    assert len(h.reconstructions.effective_units()) == 2
+    assert len(h.reconstructions.effective_blocks()) == 2
     h.set_partial("Latest partial")
     assert h.subtitle_view().en_text == "Latest partial"
 
@@ -424,7 +436,7 @@ def test_cancel_during_batch_retains_split_and_original_display():
     assert revision.chunks and not revision.paragraphs
     assert revision.translation.translation_status == "cancelled"
     assert [d["status"] for d in revision.decisions] == ["completed", "cancelled"]
-    assert len(h.reconstructions.effective_units()) == 2
+    assert len(h.reconstructions.effective_blocks()) == 2
 
 
 @pytest.mark.parametrize("status", ["incomplete", "completed"])
@@ -451,10 +463,10 @@ def test_failed_extension_keeps_previously_valid_revision():
     asyncio.run(reconstruct(h, target, [{"end_tokens": [3]}, batch("状況は変化しています。")]))
     extension = h.reconstructions.plan(add(h, "Reliability matters."))
     asyncio.run(reconstruct(h, extension, [{"end_tokens": [3, 5]}, batch()]))
-    effective = h.reconstructions.effective_units()
-    assert len(effective) == 2 and effective[0][1] == (0, 1)
-    assert effective[0][0].ja_text == "状況は変化しています。"
-    assert effective[1][0].en_text == "Reliability matters."
+    effective = h.reconstructions.effective_blocks()
+    assert len(effective) == 2 and effective[0].start == (0, 0)
+    assert effective[0].ja_text == "状況は変化しています。"
+    assert effective[1].en_text == "Reliability matters."
 
 
 def test_usage_sums_split_and_translation_attempts():
@@ -489,3 +501,167 @@ def test_usage_sums_split_and_translation_attempts():
     )
     usage = h.reconstructions.entries()[0].translation.usage
     assert usage == {"input_tokens": 30, "output_tokens": 4, "total_tokens": 34}
+
+
+def test_tail_only_crosses_unit_boundary_preserving_prefix_and_context(tmp_path):
+    h = TranslationHistory()
+    add(h, "Earlier context.")
+    add(h, "First complete thought.")
+    old = h.reconstructions.plan(add(h, "Another thought. With our."))
+    complete(
+        h,
+        old,
+        ["First complete thought.", "Another thought.", "With our."],
+        ["最初の訳。", "前半の訳。", "当社の"],
+    )
+    originals = [asdict(u) for u in h.segments()]
+    target = h.reconstructions.plan(add(h, "new platform, we can scale."))
+    assert target.en_text == "With our. new platform, we can scale."
+    assert h.reconstructions.entries()[-1].first_unit_offset == len("Another thought. ")
+    assert h.reconstructions.context_for(target.unit_id)[-1]["text"] == "Another thought."
+    complete(h, target, [target.en_text], ["当社の新しい基盤で拡張できます。"])
+    blocks = h.reconstructions.effective_blocks()
+    assert [b.en_text for b in blocks] == [
+        "Earlier context.",
+        "First complete thought.",
+        "Another thought.",
+        target.en_text,
+    ]
+    assert [b.ja_text for b in blocks[1:3]] == ["最初の訳。", "前半の訳。"]
+    assert [asdict(u) for u in h.segments()[:3]] == originals
+    saved = h.saved_text()
+    for text in ["Another thought.", "With our.", "new platform"]:
+        assert saved.count(text) == 1
+    h.save(tmp_path / "tail.jsonl")
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "tail.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    r = [r for r in rows if r["kind"] == "history_revision"][-1]
+    assert r["parent_revision_id"] == old.unit_id and r["applied"]
+    assert r["first_unit_offset"] == len("Another thought. ")
+
+
+def test_queued_job_resolves_tail_after_preceding_job_completes():
+    h = TranslationHistory()
+    add(h, "Opening.")
+    a = h.reconstructions.plan(add(h, "A complete thought. We can"))
+    b = h.reconstructions.plan(add(h, "continue."))  # Parent still queued.
+    complete(h, a, ["Opening.", "A complete thought.", "We can"])
+    # Run the actual worker: it must replace the stale queued target/context.
+    calls = asyncio.run(reconstruct(h, b, [{"end_tokens": [2]}, batch("続けられます。")]))
+    assert json.loads(calls[0]["input"])["FULL_ENGLISH"] == "We can continue."
+    assert json.loads(calls[0]["input"])["CONTEXT"][-1]["text"] == "A complete thought."
+    assert h.reconstructions.entries()[b.unit_id].translation.en_text == "We can continue."
+    assert [b.en_text for b in h.reconstructions.effective_blocks()] == [
+        "Opening.",
+        "A complete thought.",
+        "We can continue.",
+    ]
+
+
+@pytest.mark.parametrize("status", ["failed", "skipped", "cancelled", "validation_failed"])
+def test_failed_tail_job_keeps_both_prefix_and_old_tail(status):
+    h = TranslationHistory()
+    add(h, "Prefix.")
+    a = h.reconstructions.plan(add(h, "With our"))
+    complete(h, a, ["Prefix.", "With our"])
+    old = h.reconstructions.effective_blocks()
+    b = h.reconstructions.plan(add(h, "new tool."))
+    h.reconstructions.update_translation(b.unit_id, status)
+    assert h.reconstructions.effective_blocks()[:2] == old
+    assert h.reconstructions.effective_blocks()[2].en_text == "new tool."
+    c = h.reconstructions.plan(add(h, "Next sentence."))
+    assert c.en_text == "new tool. Next sentence."
+    h.set_partial("Latest speech")
+    assert h.subtitle_view().en_text == "Latest speech"
+
+
+def test_tail_limits_do_not_grow_indefinitely_and_restart_after_limit():
+    h = TranslationHistory()
+    add(h, "Word0")
+    for i in range(1, 4):
+        t = h.reconstructions.plan(add(h, f"Word{i}"))
+        complete(h, t, [t.en_text])
+    assert h.reconstructions.plan(add(h, "Word4")) is None  # Tail spans 4 original units.
+    next_target = h.reconstructions.plan(add(h, "Word5"))
+    assert next_target.en_text == "Word4 Word5"
+    assert " ".join(b.en_text for b in h.reconstructions.effective_blocks()) == (
+        "Word0 Word1 Word2 Word3 Word4 Word5"
+    )
+
+
+def test_queued_tail_can_hit_character_limit_after_parent_completion():
+    h = TranslationHistory()
+    add(h, "A" * 700)
+    a = h.reconstructions.plan(add(h, "B" * 700))
+    b = h.reconstructions.plan(add(h, "C" * 700))
+    assert b is not None  # Reservation was 1401 chars before A+B completed.
+    complete(h, a, [a.en_text])
+    assert h.reconstructions.prepare(b.unit_id) is None
+    assert h.reconstructions.entries()[b.unit_id].translation.translation_status == "skipped"
+    assert len(h.reconstructions.effective_blocks()) == 2
+
+
+@pytest.mark.parametrize("boundary", ["clear", "session", "speaker", "unknown"])
+def test_tail_never_crosses_display_or_speaker_session_boundaries(boundary):
+    h = TranslationHistory()
+    add(h, "First.")
+    a = h.reconstructions.plan(add(h, "With our"))
+    complete(h, a, ["First.", "With our"])
+    kwargs = {}
+    if boundary == "clear":
+        h.clear_display()
+    elif boundary == "session":
+        kwargs["session"] = "next"
+    else:
+        kwargs["speaker"] = "S2" if boundary == "speaker" else "UU"
+    assert h.reconstructions.plan(add(h, "Next speech.", **kwargs)) is None
+
+
+def test_clear_invalidates_queued_tail_without_erasing_saved_history():
+    h = TranslationHistory()
+    add(h, "First.")
+    t = h.reconstructions.plan(add(h, "Second."))
+    h.clear_display()
+    assert h.reconstructions.prepare(t.unit_id) is None
+    assert len(h.reconstructions.effective_blocks()) == 2
+
+
+def test_existing_tail_cannot_fragment_again_but_can_join_new_speech():
+    h = TranslationHistory()
+    add(h, "Retained prefix.")
+    a = h.reconstructions.plan(add(h, "Please. Dial in."))
+    complete(
+        h, a, ["Retained prefix.", "Please. Dial in."], ["保持する訳。", "電話で参加してください。"]
+    )
+    b = h.reconstructions.plan(add(h, "To the call. Another topic."))
+    # Model tries Please. / Dial in. To the call. / Another topic.
+    calls = asyncio.run(
+        reconstruct(
+            h, b, [{"end_tokens": [0, 5, 7]}, batch("電話で会議に参加してください。", "別の話題。")]
+        )
+    )
+    data = json.loads(calls[1]["input"])
+    assert data["TARGETS"] == [
+        {"id": 0, "text": "Please. Dial in. To the call."},
+        {"id": 1, "text": "Another topic."},
+    ]
+    assert h.reconstructions.entries()[-1].decisions[0]["decision"]["end_tokens"] == [0, 5, 7]
+    assert [b.en_text for b in h.reconstructions.effective_blocks()] == [
+        "Retained prefix.",
+        "Please. Dial in. To the call.",
+        "Another topic.",
+    ]
+    assert h.reconstructions.effective_blocks()[0].ja_text == "保持する訳。"
+
+
+def test_protected_tail_never_repairs_invalid_raw_coverage():
+    with pytest.raises(ValueError, match="coverage"):
+        split_english(
+            "Please. Dial in. Now.",
+            EnglishSplit(end_tokens=[0, 2]),
+            protected_prefix_chars=len("Please. Dial in."),
+        )
+    with pytest.raises(ValueError, match="prefix"):
+        split_english("Yes. ", EnglishSplit(end_tokens=[0]), protected_prefix_chars=5)

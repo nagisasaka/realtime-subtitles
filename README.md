@@ -21,14 +21,21 @@ Speechmatics Translationは設定・使用しません。OpenAI Realtime Transla
 ### 履歴の英文分割 → チャンク一括翻訳
 
 最新枠はこれまでどおり2-final単位で即時翻訳します。別workerで、同じ話者・同じ認識sessionの
-連続する履歴を**2〜3 TranslationUnits、最大1,800文字**の範囲で再構成します。
-2 unitsがそろった時点で依頼し、次のunitで最大3 unitsへ拡張して再度見直します。
-上限に達したら次の範囲へ進むため、無制限に過去全文を再送しません。
+履歴の**最後の1段落＋新しいTranslationUnit**だけを再構成します。
+前回の後ろが `With our.`、続きが `Key. Business.` なら同じ対象として再検討できます。
+それより前の英日ペアは保持します。時間による保留は追加せず、新しいunitの到着を契機にします。
+
+対象は合計最大1,800文字、引き継ぐ段落は元の最大3 unitsまで（新しい1 unitを加えて最大4 units）。
+上限超過時は見直しをskipし、元の字幕を残します。過去全文を繰り返し送信しません。
+最初や直前の見直しが失敗した場合は、直前の元unit＋新unitを対象にします。
+queue待ち中に前の処理が完了する場合があるため、引き継ぐ段落は専用workerの実行開始時に確定します。
 
 処理順序は次のとおりです。通常は1範囲につきLunaを**2回**呼び出します。
 
 1. 英語を結合し、最初のAPI呼び出しで意味のまとまりの**英文境界だけ**を決めます。
    LLMは末尾token indexを返し、アプリが元の英文を切り出してチャンクIDを付けます。
+   引き継ぐ検証済み段落の内部に新しい境界は作りません。その段落と続きを結ぶ境界は変更できます。
+   この制限は文法を推測するルールではなく、既存段落を再び細切れにしないための編集範囲の制限です。
 2. 境界を確定した後、2回目のAPI呼び出しで全チャンクをまとめて日本語へ翻訳します。
    各チャンクの訳は `{id, ja}` で受け取り、返却順に依存せず英日を対応付けます。
    過去の確定英文（最大5 TranslationUnits）をCONTEXTとし、対象チャンク群も一緒に読ませますが、
@@ -48,21 +55,27 @@ Speechmatics Translationは設定・使用しません。OpenAI Realtime Transla
 構造検証で日本語の意味や訳抜けを完全に保証できるわけではありません。
 
 全文の日本語訳を別に生成し、その部分訳との連結一致を求める旧処理は削除しました。
-JSONLへ `history_revision` として、固定した `chunks`、段階別 `decisions`（split/translate）、
+JSONLへ `history_revision` として、`unit_ids` / `first_unit_offset` / `parent_revision_id` / `applied`、
+固定した `chunks`、段階別 `decisions`（split/translate）、
 呼び出しごとの使用量・所要時間、翻訳候補・検証結果・最終 `paragraphs` を保存します。
 元のASR英語・元の翻訳は変更しません。`translation.ja_text` は保存用に部分訳をローカルで
-連結したものです。TXTには最新の有効な再構成を反映します。
+連結したものです。TXTには最新の有効な段落を一度ずつ反映します。
+英文のunit ID＋文字位置で置換範囲を管理するため、同じunitの前半を残して末尾だけ更新できます。
+TXTの時刻は元unitの範囲であり、切り出した文字位置の正確な発話時刻を推定したものではありません。
 
 結果は全構成unitが履歴へ移ってから反映し、小さい日本語を対応する英語の上に表示します。
 最新枠の表示・移動条件は変更しません。古い翻訳や古い再構成結果は新しい表示を上書きしません。
 履歴を読み直している間は、可能な限り英語文字位置を閲覧位置として保ちます。
 
 モデルは両段階とも `gpt-6-luna / reasoning.effort=none`。初回翻訳に加えて2段階のAPI料金・遅延が
-発生します。専用workerは1並列・待ちqueueは最大2件。混雑時は再構成をskipして元の字幕を残します。
+発生します。同じ既知話者が続く場合、新unitごとに1見直しを予約します。
+旧方式は3 unitsにつき最大2見直しだったため、成功が続く場合の履歴側の呼び出し頻度は約1.5倍になります。
+専用workerは1並列・待ちqueueは最大2件。混雑時は再構成をskipして元の字幕を残します。
 同じ既知話者の範囲だけを対象に、話者／session／Clearの境界を越えません。
 Diagnosticsの `history_reconstruction` で件数・queue・失敗状態を確認できます。
 新方式の実測・テスト結果は [実装レポート](docs/history-split-first-implementation.md) に記載しています。
 分割プロンプト改善後のEarnings22試験は [改善評価](docs/history-dependency-prompt-evaluation.md) に記載しています。
+末尾段落を次の範囲へ引き継ぐ変更は [境界評価](docs/history-tail-review-evaluation.md) に記載しています。
 旧方式の評価結果は [過去の評価記録](docs/history-readability-results.md) に残しています。
 
 ## Gitの復元ポイント

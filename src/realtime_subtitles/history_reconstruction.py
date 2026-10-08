@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass, replace
 
 from pydantic import BaseModel, StrictInt
@@ -12,8 +13,8 @@ from .text_translation import MODEL, OpenAITranslator, TranslationWorker, safe_e
 from .translation_history import UNKNOWN_SPEAKERS, TranslationUnit
 from .translation_validation import TranslationValidator
 
-MAX_REVISION_UNITS = 3
 MAX_REVISION_CHARS = 1800
+MAX_TAIL_UNITS = 3
 SPLIT_INSTRUCTIONS = """Divide FULL_ENGLISH into readable, meaningful English subtitle chunks.
 Choose boundaries before translation; do not translate or generate replacement English.
 ASR punctuation, capitalization and streaming cuts are unreliable sentence boundaries.
@@ -90,7 +91,7 @@ class ReconstructedParagraph:
     ja_text: str
 
 
-def split_english(english, decision):
+def split_english(english, decision, *, protected_prefix_chars=0):
     """Check complete, ordered token coverage and slice the original, never model prose."""
     tokens = list(re.finditer(r"\S+", english))
     if not tokens or not decision.end_tokens:
@@ -103,6 +104,22 @@ def split_english(english, decision):
         next_token = end + 1
     if next_token != len(tokens):
         raise ValueError("English coverage incomplete")
+    if not 0 <= protected_prefix_chars <= len(english):
+        raise ValueError("Invalid protected history prefix")
+    # Keep an already validated paragraph intact. The model may join it to the
+    # new speech, but cannot fragment its interior again. Validate raw coverage
+    # BEFORE this restriction so malformed model decisions are never repaired.
+    if protected_prefix_chars:
+        ends = [c.en_end for c in chunks if c.en_end >= protected_prefix_chars]
+        if not ends:
+            raise ValueError("Protected prefix extends beyond source tokens")
+        starts = [chunks[0].en_start] + [
+            next(t.start() for t in tokens if t.start() >= end) for end in ends[:-1]
+        ]
+        chunks = [
+            EnglishChunk(i, start, end)
+            for i, (start, end) in enumerate(zip(starts, ends, strict=True))
+        ]
     return tuple(chunks)
 
 
@@ -192,7 +209,11 @@ class ReconstructionTranslator(OpenAITranslator):
                 },
                 EnglishSplit,
             )
-            chunks = split_english(target.en_text, decision)
+            chunks = split_english(
+                target.en_text,
+                decision,
+                protected_prefix_chars=self.history.protected_prefix_for(target.unit_id),
+            )
             self.history.set_chunks(target.unit_id, chunks)
         # A retry reuses these immutable boundaries; it never requests a new split.
         decision = await self._decision(
@@ -215,6 +236,13 @@ class ReconstructionTranslator(OpenAITranslator):
 
 
 class ReconstructionWorker(TranslationWorker):
+    async def _one(self, translator, segment, context):
+        # Resolve at execution time: the preceding queued translation may just
+        # have completed. No timer, wait for another final, or STT-thread work.
+        segment = self.history.prepare(segment.unit_id)
+        if segment is not None:
+            await super()._one(translator, segment, self.history.context_for(segment.unit_id))
+
     def _validate(self, segment, text, context):
         return validate_paragraphs(
             segment.en_text,
@@ -244,6 +272,56 @@ class HistoryRevision:
     decisions: tuple = ()
     chunks: tuple[EnglishChunk, ...] = ()
     paragraphs: tuple[ReconstructedParagraph, ...] = ()
+    first_unit_offset: int = 0
+    parent_revision_id: int | None = None
+    applied: bool = False
+
+
+@dataclass(frozen=True)
+class HistoryBlock:
+    key: str
+    start: tuple[int, int]
+    end: tuple[int, int]
+    en_text: str
+    ja_text: str | None
+    translation_status: str
+    speaker: str | None
+    break_before: bool
+    # (unit_id, start/end in stripped original unit, start/end in this block)
+    source_runs: tuple
+    revision_id: int = -1
+
+
+def original_block(unit):
+    en = unit.en_text.strip()
+    return HistoryBlock(
+        f"u{unit.unit_id}",
+        (unit.unit_id, 0),
+        (unit.unit_id, len(en)),
+        en,
+        unit.ja_text,
+        unit.translation_status,
+        unit.speaker,
+        unit.break_before,
+        ((unit.unit_id, 0, len(en), 0, len(en)),),
+    )
+
+
+def replacement_slice(blocks, starts, start, end, revision_id):
+    """Only replace whole displayed paragraphs; never clip an existing JA."""
+    lo = bisect_left(starts, start)
+    hi = bisect_right(starts, end)
+    if hi > lo and blocks[hi - 1].start == end:
+        hi -= 1
+    selected = blocks[lo:hi]
+    if (
+        not selected
+        or selected[0].start != start
+        or selected[-1].end != end
+        or any(b.revision_id > revision_id for b in selected)
+    ):
+        return None
+    return lo, hi
 
 
 class ReconstructionHistory:
@@ -257,70 +335,177 @@ class ReconstructionHistory:
         self.owner = owner
         self.clock = owner.clock
         self._entries = []
-        self._latest_group = {}
+        self._planned = set()
+        self._blocks = []
+        self._starts = []
+        self._by_end = {}
         self._counts = {}
 
     def _record(self, revision):
         self.owner._journal.append({"kind": "history_revision", **asdict(revision)})
         self.owner._revision += 1
 
+    def add_unit(self, unit):
+        block = original_block(unit)
+        self._blocks.append(block)
+        self._starts.append(block.start)
+        self._by_end[block.end[0]] = block
+
+    def update_original(self, unit):
+        start = (unit.unit_id, 0)
+        index = bisect_left(self._starts, start)
+        if index < len(self._blocks) and self._blocks[index].key == f"u{unit.unit_id}":
+            block = original_block(unit)
+            self._blocks[index] = block
+            self._by_end[unit.unit_id] = block
+
+    def _selection(self, current):
+        i = current.unit_id
+        units = self.owner._segments
+        if i == 0:
+            return None
+        previous = units[i - 1]
+        if not (
+            current.session_id is not None
+            and current.session_id == previous.session_id
+            and current.speaker not in UNKNOWN_SPEAKERS
+            and current.speaker == previous.speaker
+            and not current.break_before
+        ):
+            return None
+        # The last *applied* paragraph, or the previous original unit when the
+        # sidecar failed/skipped. A stale/in-flight revision is never a parent.
+        tail = self._by_end.get(i - 1)
+        if tail is None or tail.end != (i - 1, len(previous.en_text.strip())):
+            return None
+        ids = tuple(range(tail.start[0], i + 1))
+        if len(ids) > MAX_TAIL_UNITS + 1:
+            return None
+        first = units[ids[0]]
+        if first.source_segment_ids[0] < self.owner._display_start:
+            return None
+        if any(
+            u.session_id != current.session_id or u.speaker != current.speaker
+            for u in units[ids[0] : i + 1]
+        ):
+            return None
+        en = tail.en_text + " " + current.en_text.strip()
+        if len(en) > MAX_REVISION_CHARS:
+            return None
+        return ids, tail, en
+
+    def _target(self, current, identity, selection, queued_at):
+        ids, tail, en = selection
+        selected = [self.owner._segments[i] for i in ids]
+        first = selected[0]
+        return TranslationUnit(
+            sequence_id=identity,
+            en_text=en,
+            speaker=current.speaker,
+            start_ms=first.start_ms,
+            end_ms=current.end_ms,
+            session_id=current.session_id,
+            received_at=current.received_at,
+            received_monotonic_ms=current.received_monotonic_ms,
+            source_segment_ids=tuple(k for u in selected for k in u.source_segment_ids),
+            raw_source_segments=tuple(s for u in selected for s in u.raw_source_segments),
+            break_before=tail.break_before,
+            assembled_monotonic_ms=queued_at,
+            assembly_reason="history_tail_review",
+            latency_origin="new_translation_unit_received",
+        )
+
     def plan(self, current):
         with self.owner._lock:
-            units = self.owner._segments
-            i = current.unit_id
-            if i == 0:
+            if current.unit_id in self._planned:
                 return None
-            previous = units[i - 1]
-            if not (
-                current.session_id is not None
-                and current.session_id == previous.session_id
-                and current.speaker not in UNKNOWN_SPEAKERS
-                and current.speaker == previous.speaker
-                and not current.break_before
-            ):
+            self._planned.add(current.unit_id)
+            selection = self._selection(current)
+            if selection is None:
                 return None
-            if i in self._latest_group:
-                return None  # One plan per following final, including failed/skipped jobs.
-            group = self._latest_group.get(i - 1)
-            prior = self._entries[group] if group is not None else None
-            extend = prior and prior.translation.translation_status in {
-                "pending",
-                "translating",
-                "retrying",
-                "completed",
-            }
-            ids = prior.unit_ids if extend else (i - 1,)
-            if len(ids) >= MAX_REVISION_UNITS:
-                return None
-            ids = (*ids, i)
-            first = units[ids[0]]
-            if first.source_segment_ids[0] < self.owner._display_start:
-                return None  # Clear/restart is also a display reconstruction boundary.
-            selected = [units[j] for j in ids]
-            en = " ".join(u.en_text.strip() for u in selected)
-            if len(en) > MAX_REVISION_CHARS:
-                return None
-            target = TranslationUnit(
-                sequence_id=len(self._entries),
-                en_text=en,
-                speaker=first.speaker,
-                start_ms=first.start_ms,
-                end_ms=current.end_ms,
-                session_id=first.session_id,
-                received_at=first.received_at,
-                received_monotonic_ms=first.received_monotonic_ms,
-                source_segment_ids=tuple(k for u in selected for k in u.source_segment_ids),
-                raw_source_segments=tuple(s for u in selected for s in u.raw_source_segments),
-                break_before=first.break_before,
-                assembled_monotonic_ms=round(self.clock() * 1000),
-                assembly_reason="history_reconstruction",
+            ids, tail, _ = selection
+            target = self._target(
+                current, len(self._entries), selection, round(self.clock() * 1000)
             )
-            revision = HistoryRevision(target.unit_id, ids, "llm_review", target)
+            revision = HistoryRevision(
+                target.unit_id,
+                ids,
+                "tail_review",
+                target,
+                first_unit_offset=tail.start[1],
+                parent_revision_id=tail.revision_id if tail.revision_id >= 0 else None,
+            )
             self._entries.append(revision)
             self._counts["pending"] = self._counts.get("pending", 0) + 1
-            self._latest_group.update((j, revision.revision_id) for j in ids)
             self._record(revision)
             return target
+
+    def prepare(self, revision_id):
+        with self.owner._lock:
+            old = self._entries[revision_id]
+            if old.decisions or old.chunks:
+                return old.translation  # Never change a target after an API request.
+            current = self.owner._segments[old.unit_ids[-1]]
+            selection = self._selection(current)
+            if selection is None:
+                self.update_translation(revision_id, "skipped", error="tail_limit_or_boundary")
+                return None
+            ids, tail, _ = selection
+            target = self._target(
+                current, revision_id, selection, old.translation.assembled_monotonic_ms
+            )
+            new = replace(
+                old,
+                unit_ids=ids,
+                translation=target,
+                first_unit_offset=tail.start[1],
+                parent_revision_id=tail.revision_id if tail.revision_id >= 0 else None,
+            )
+            self._entries[revision_id] = new
+            if new != old:
+                self._record(new)
+            return target
+
+    def blocks_for(self, revision):
+        """Map immutable English slices back to unit/character positions."""
+        mappings, offset = [], 0
+        for j, identity in enumerate(revision.unit_ids):
+            raw = self.owner._segments[identity].en_text.strip()
+            begin = revision.first_unit_offset if j == 0 else 0
+            mappings.append((identity, begin, len(raw), offset, offset + len(raw) - begin))
+            offset += len(raw) - begin + 1
+        target, blocks = revision.translation, []
+        for index, p in enumerate(revision.paragraphs):
+            runs = []
+            for identity, begin, _, lo, hi in mappings:
+                start, end = max(lo, p.en_start), min(hi, p.en_end)
+                if start < end:
+                    runs.append(
+                        (
+                            identity,
+                            begin + start - lo,
+                            begin + end - lo,
+                            start - p.en_start,
+                            end - p.en_start,
+                        )
+                    )
+            if not runs:
+                raise ValueError("History paragraph without source")
+            blocks.append(
+                HistoryBlock(
+                    f"r{revision.revision_id}p{index}",
+                    (runs[0][0], runs[0][1]),
+                    (runs[-1][0], runs[-1][2]),
+                    target.en_text[p.en_start : p.en_end],
+                    p.ja_text,
+                    "completed",
+                    target.speaker,
+                    target.break_before and index == 0,
+                    tuple(runs),
+                    revision.revision_id,
+                )
+            )
+        return tuple(blocks)
 
     def record_decision(self, revision_id, decision, usage, *, stage, status, latency_ms, error=""):
         with self.owner._lock:
@@ -355,6 +540,14 @@ class ReconstructionHistory:
         with self.owner._lock:
             return self._entries[revision_id].chunks
 
+    def protected_prefix_for(self, revision_id):
+        with self.owner._lock:
+            revision = self._entries[revision_id]
+            if revision.parent_revision_id is None:
+                return 0
+            current = self.owner._segments[revision.unit_ids[-1]]
+            return len(revision.translation.en_text) - len(current.en_text.strip()) - 1
+
     def usage_for(self, revision_id):
         with self.owner._lock:
             usages = [d["usage"] for d in self._entries[revision_id].decisions if d["usage"]]
@@ -378,7 +571,13 @@ class ReconstructionHistory:
 
     def context_for(self, revision_id):
         with self.owner._lock:
-            return self.owner.context_for(self._entries[revision_id].unit_ids[0])
+            revision = self._entries[revision_id]
+            first = self.owner._segments[revision.unit_ids[0]]
+            context = self.owner.context_for(first.unit_id)
+            prefix = first.en_text.strip()[: revision.first_unit_offset].strip()
+            if prefix and self.owner.context_segments:
+                context.append({"speaker": first.speaker, "text": prefix})
+            return context[-self.owner.context_segments :] if self.owner.context_segments else []
 
     def previous_translations(self, revision_id):
         with self.owner._lock:
@@ -404,6 +603,23 @@ class ReconstructionHistory:
                     **metadata,
                 ),
             )
+            if status == "completed":
+                if not revision.paragraphs:
+                    raise ValueError("Completed revision without paragraphs")
+                blocks = self.blocks_for(revision)
+                selected = replacement_slice(
+                    self._blocks, self._starts, blocks[0].start, blocks[-1].end, revision_id
+                )
+                if selected is not None:
+                    lo, hi = selected
+                    for b in self._blocks[lo:hi]:
+                        if self._by_end.get(b.end[0]) == b:
+                            del self._by_end[b.end[0]]
+                    self._blocks[lo:hi] = blocks
+                    self._starts[lo:hi] = [b.start for b in blocks]
+                    for b in blocks:
+                        self._by_end[b.end[0]] = b
+                    revision = replace(revision, applied=True)
             self._entries[revision_id] = revision
             old_status = old.translation.translation_status
             self._counts[old_status] -= 1
@@ -423,24 +639,10 @@ class ReconstructionHistory:
             )
             return tuple(self._entries[i] for i in ids)
 
-    def effective_units(self):
-        """Chronological TXT export; JSONL also retains all originals/revisions."""
+    def effective_blocks(self):
+        """Chronological current paragraphs; originals/revisions remain in JSONL."""
         with self.owner._lock:
-            covered, revisions = set(), {}
-            for revision in reversed(self._entries):
-                if revision.translation.translation_status != "completed":
-                    continue
-                if covered.intersection(revision.unit_ids):
-                    continue
-                covered.update(revision.unit_ids)
-                revisions[revision.unit_ids[0]] = revision
-            return [
-                (revisions[u.unit_id].translation, revisions[u.unit_id].unit_ids)
-                if u.unit_id in revisions
-                else (u, ())
-                for u in self.owner._segments
-                if u.unit_id not in covered or u.unit_id in revisions
-            ]
+            return tuple(self._blocks)
 
     def statistics(self):
         with self.owner._lock:

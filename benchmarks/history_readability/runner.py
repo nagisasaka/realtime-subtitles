@@ -123,7 +123,13 @@ class Runner:
             return result
 
     async def translate(
-        self, window, prompt, *, nonce="", translation_prompt=BATCH_TRANSLATION_INSTRUCTIONS
+        self,
+        window,
+        prompt,
+        *,
+        nonce="",
+        translation_prompt=BATCH_TRANSLATION_INSTRUCTIONS,
+        protected_prefix_chars=0,
     ):
         data = {
             "CONTEXT": window["context"],
@@ -133,14 +139,23 @@ class Runner:
             ],
         }
         attempts = []
-        result = {"id": window["id"], "input_hash": digest(data), "attempts": attempts}
+        result = {
+            "id": window["id"],
+            "input_hash": digest(data),
+            "attempts": attempts,
+            "protected_prefix_chars": protected_prefix_chars,
+        }
         call = await self.call(window["id"] + "-split", prompt, data, EnglishSplit, nonce=nonce)
         attempts.append(dict(call, stage="split"))
         result["status"] = call["status"]
         if call["status"] != "completed" or not call.get("parsed"):
             return result
         try:
-            chunks = split_english(window["english"], EnglishSplit.model_validate(call["parsed"]))
+            chunks = split_english(
+                window["english"],
+                EnglishSplit.model_validate(call["parsed"]),
+                protected_prefix_chars=protected_prefix_chars,
+            )
         except ValueError as exc:
             return dict(result, status="structural_failure", structural_error=type(exc).__name__)
         result["chunks"] = [asdict(c) for c in chunks]

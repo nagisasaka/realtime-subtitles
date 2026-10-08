@@ -21,7 +21,9 @@ Earnings22の取得済み結果directoryを指定する。取得元worktreeへ�
 `--anchors <file>` を加えると、manifestが未作成の場合だけ入力・context・原文・出典hash・baseline promptを保存する。
 重複する原文/contextがdev/holdoutに跨る選定は拒否する。正常EOSのないsessionも拒否する。
 再生は全イベントの受信順から行い、partialの話者変化とEOSもassemblerへ反映する。
-最終的な最大windowを採点し、途中の2単位版を同じ母数へ二重計上しない。
+`prepare` はAPI応答を注入しないため、現在は直前の元unit＋新unitという初期候補を列挙する。
+前回の検証済み段落を引き継ぐ連続処理は、下記 `tail_review` で評価する。
+以前の3-unit windowのmanifestは保存済みの実験入力としてのみ使用し、現在のplannerが再生成したものとは扱わない。
 queue failureや再翻訳到着時間による実画面状態まではこのplanner再現に含まない。
 
 ## 実API評価
@@ -136,3 +138,29 @@ local replay時に変化する `raw_sources.received_at` だけを比較から�
 既知4窓は未見holdoutではない。調整後の未使用2窓は別の `fresh_manifest.json` に固定し、
 同じ `Runner` / ledgerで両promptを評価した。追加request上限を別directoryで回避していない。
 全候補と棄却理由・採点の矛盾も保存し、最良出力だけを残す扱いはしていない。
+
+
+## 次の範囲へ履歴末尾を引き継ぐ評価
+
+```bash
+.venv/bin/python -m benchmarks.history_readability.tail_review \
+  --output benchmark_results/history_readability/tail_review_20261008 \
+  --baseline benchmark_results/history_readability/dependency_prompt_20261008 \
+  --name stable_tail
+```
+
+前回の検証済み表示を同一の初期状態とし、元ASRから続きの3 TranslationUnitsを取り出す。
+比較前はその3 unitsを独立した旧windowとして分割・翻訳する。比較後は本番のplannerと文字位置の置換処理を使い、
+新しいunitごとに末尾段落だけを再検討する。英文分割・翻訳promptは両案で同じ。
+過去の原文・CONTEXT・両段階のraw response・source位置・保持された前半を保存し、全文tokenの欠落・重複を検査する。
+引き継ぐ段落を内部で再分割しない制限も本番と同じ `split_english` を使う。
+
+対象は選定済み6ケースのみ。`--ids` で絞れ、`--nonce repeat1 --name repeat` はcacheなしで再生成する。
+全requestは既存Runnerの同一ledger（最大80）、deadline240秒、SDK retryなしで管理する。
+元ASRファイルのSHA-256を再実行時にも照合する。前回の評価directoryへ書き込まない。
+前半のJAは変更せず、JSONL/TXTへ最終表示と原文・revisionをそれぞれ保存する。
+
+これは順次処理による境界品質の評価であり、マイク・音声再生・Speechmatics・初回ライブ翻訳は実行しない。
+比較前は最終3-unit windowだけを生成し、途中の2-unit版は生成しないため、request総数を本番の料金比率と解釈しない。
+queue詰まり・ライブ遅延は別の検証が必要。調整中の最初の試行 `comparison.json` も残し、
+最終採用した内部境界維持版は `stable_tail.json` として別保存している。

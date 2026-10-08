@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import tkinter as tk
+from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font, ttk
@@ -14,6 +15,7 @@ from tkinter import filedialog, font, ttk
 from .audio import list_microphones
 from .audio_file import inspect_wav
 from .autosave import TranscriptAutosave
+from .history_reconstruction import original_block, replacement_slice
 from .live_client import LiveClient
 from .realtime_api import State
 from .settings import Settings
@@ -242,6 +244,9 @@ class SubtitleApp:
         self._history_revision_pending = {}
         self._history_group_for_unit = {}
         self._history_english_runs = {}
+        self._history_blocks = []
+        self._history_starts = []
+        self._history_block_runs = {}
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
         if audio_file is not None:
@@ -716,10 +721,14 @@ class SubtitleApp:
             self._history_revision_pending.clear()
             self._history_group_for_unit.clear()
             self._history_english_runs.clear()
+            self._history_blocks.clear()
+            self._history_starts.clear()
+            self._history_block_runs.clear()
         for revision in revisions:
             if (
                 revision.translation.translation_status == "completed"
                 and revision.paragraphs
+                and revision.applied
                 and revision.translation.source_segment_ids[0] >= display_start
             ):
                 self._history_revision_pending[revision.revision_id] = revision
@@ -740,7 +749,7 @@ class SubtitleApp:
         if reset:
             text.delete("1.0", "end")
             for mark in text.mark_names():
-                if mark.startswith("pair_"):
+                if mark.startswith(("pair_", "block_")):
                     text.mark_unset(mark)
             at_top = True
         for unit in sorted(ready, key=lambda u: u.unit_id):
@@ -787,6 +796,26 @@ class SubtitleApp:
                 self._history_english_runs[identity] = [
                     (en_start, 0, text.tk.call("string", "length", unit.en_text))
                 ]
+            block = original_block(unit)
+            index = bisect_left(self._history_starts, block.start)
+            if index < len(self._history_blocks) and self._history_blocks[index].key == block.key:
+                self._history_blocks[index] = block
+            else:
+                self._history_starts.insert(index, block.start)
+                self._history_blocks.insert(index, block)
+            self._history_block_runs[block.key] = [
+                (identity, *run) for run in self._history_english_runs[identity]
+            ]
+            # Dedicated block marks survive a unit being divided across revisions.
+            for suffix, source in [
+                ("start", begin),
+                ("ja", ja_start),
+                ("en", en_start),
+                ("end", f"pair_{identity}_end"),
+            ]:
+                mark = f"block_{block.key}_{suffix}"
+                text.mark_set(mark, source)
+                text.mark_gravity(mark, "left" if suffix == "end" else "right")
             self._history_rendered.add(identity)
             del self._history_pending[identity]
         for revision in sorted(applicable, key=lambda r: r.revision_id):
@@ -806,78 +835,99 @@ class SubtitleApp:
 
     def _replace_history_group(self, revision):
         text = self.history_text
-        unit, ids = revision.translation, revision.unit_ids
-        start, end = f"pair_{max(ids)}_start", f"pair_{min(ids)}_end"
-        position = text.index(start)
-        within = text.compare("reading_position", ">=", start) and text.compare(
-            "reading_position", "<", end
+        with self.client.history._lock:
+            blocks = self.client.history.reconstructions.blocks_for(revision)
+        selected = replacement_slice(
+            self._history_blocks,
+            self._history_starts,
+            blocks[0].start,
+            blocks[-1].end,
+            revision.revision_id,
         )
-        # Preserve an original-English character anchor across semantic splits.
-        # Japanese can now be inserted INSIDE an old unit, so keep individual runs.
-        anchor = None
-        for identity in ids:
-            for mark, local_offset, size in self._history_english_runs.get(identity, ()):
+        if selected is None:
+            return  # Stale result or a parent not applicable to this display.
+        lo, hi = selected
+        removed = self._history_blocks[lo:hi]
+        insertion, anchor, reading_removed = None, None, False
+        for block in removed:
+            start, end = f"block_{block.key}_start", f"block_{block.key}_end"
+            if insertion is None or text.compare(start, "<", insertion):
+                insertion = text.index(start)
+            within = text.compare("reading_position", ">=", start) and text.compare(
+                "reading_position", "<", end
+            )
+            reading_removed |= within
+            for identity, mark, local, size in self._history_block_runs[block.key]:
                 if (
                     within
                     and text.compare("reading_position", ">=", mark)
                     and text.compare("reading_position", "<", f"{mark}+{size}c")
                 ):
                     count = text.count(mark, "reading_position", "chars")
-                    anchor = (identity, local_offset + (count[0] if count else 0))
-        with self.client.history._lock:
-            originals = [self.client.history._segments[i] for i in ids]
-        text.delete(start, end)
-        speaker = f"↳ {unit.speaker or ''}\n" if unit.break_before else ""
-        chunks = [speaker, "speaker"]
-        rendered = speaker
-        english_runs = []
+                    anchor = identity, local + (count[0] if count else 0)
+        text.mark_set("revision_insertion", insertion)
+        text.mark_gravity("revision_insertion", "left")
+        removed_marks, affected = set(), set()
+        for block in removed:
+            # Tail and new unit may be separated on screen by retained prefix
+            # paragraphs. Delete each range separately, preserving that prefix.
+            text.delete(f"block_{block.key}_start", f"block_{block.key}_end")
+            for identity, mark, _, _ in self._history_block_runs.pop(block.key):
+                affected.add(identity)
+                removed_marks.add(mark)
+            for suffix in ("start", "ja", "en", "end"):
+                text.mark_unset(f"block_{block.key}_{suffix}")
+        for identity in affected:
+            self._history_english_runs[identity] = [
+                run
+                for run in self._history_english_runs.get(identity, ())
+                if run[0] not in removed_marks
+            ]
+        for mark in removed_marks:
+            if "_run_" in mark:
+                text.mark_unset(mark)
+        position, rendered, chunks, offsets = text.index("revision_insertion"), "", [], []
 
         def size(value):
             return int(text.tk.call("string", "length", value))
 
-        for paragraph in revision.paragraphs:
-            ja = paragraph.ja_text + "\n"
-            en = unit.en_text[paragraph.en_start : paragraph.en_end]
-            english_runs.append((paragraph, size(rendered + ja)))
-            chunks.extend((ja, "ja", en + "\n", "en"))
-            rendered += ja + en + "\n"
-        text.insert(position, *chunks)
-        prefix = 0
-        for original in originals:
-            identity = original.unit_id
-            raw = original.en_text.strip()
-            leading = size(
-                original.en_text[: len(original.en_text) - len(original.en_text.lstrip())]
+        for block in blocks:
+            speaker = f"↳ {block.speaker or ''}\n" if block.break_before else ""
+            ja = (block.ja_text or "") + "\n"
+            offsets.append(
+                (size(rendered), size(rendered + speaker), size(rendered + speaker + ja))
             )
-            for mark, _, _ in self._history_english_runs.get(identity, ()):
-                if "_run_" in mark:
-                    text.mark_unset(mark)
-            runs = []
-            for paragraph, rendered_start in english_runs:
-                lo, hi = max(prefix, paragraph.en_start), min(prefix + len(raw), paragraph.en_end)
-                if lo >= hi:
-                    continue
-                mark = f"pair_{identity}_run_{len(runs)}"
-                offset = rendered_start + size(unit.en_text[paragraph.en_start : lo])
+            chunks.extend((speaker, "speaker", ja, "ja", block.en_text + "\n", "en"))
+            rendered += speaker + ja + block.en_text + "\n"
+        text.insert(position, *chunks)
+        for block, (start, ja, en) in zip(blocks, offsets, strict=True):
+            end = en + size(block.en_text + "\n")
+            for suffix, offset in [("start", start), ("ja", ja), ("en", en), ("end", end)]:
+                mark = f"block_{block.key}_{suffix}"
                 text.mark_set(mark, f"{position}+{offset}c")
-                text.mark_gravity(mark, "right")
-                runs.append(
-                    (mark, leading + size(raw[: lo - prefix]), size(raw[lo - prefix : hi - prefix]))
-                )
-            self._history_english_runs[identity] = runs
-            marks = {
-                "start": position,
-                "ja": f"{position}+{size(speaker)}c",
-                "en": runs[0][0],
-                "end": f"{position}+{size(rendered)}c",
-            }
-            for suffix, index in marks.items():
-                mark = f"pair_{identity}_{suffix}"
-                text.mark_set(mark, index)
                 text.mark_gravity(mark, "left" if suffix == "end" else "right")
-            self._history_group_for_unit[identity] = revision.revision_id
-            prefix += len(raw) + 1
-        if within:
+            runs = []
+            for j, (identity, begin, _finish, block_begin, block_end) in enumerate(
+                block.source_runs
+            ):
+                original = self.client.history._segments[identity].en_text.strip()
+                mark = f"block_{block.key}_run_{j}"
+                text.mark_set(mark, f"{position}+{en + size(block.en_text[:block_begin])}c")
+                text.mark_gravity(mark, "right")
+                local, length = size(original[:begin]), size(block.en_text[block_begin:block_end])
+                runs.append((identity, mark, local, length))
+                self._history_english_runs.setdefault(identity, []).append((mark, local, length))
+                self._history_group_for_unit[identity] = revision.revision_id
+                affected.add(identity)
+            self._history_block_runs[block.key] = runs
+        self._history_blocks[lo:hi] = blocks
+        self._history_starts[lo:hi] = [b.start for b in blocks]
+        for identity in affected:
+            runs = sorted(self._history_english_runs[identity], key=lambda r: r[1])
+            self._history_english_runs[identity] = runs
+            if runs:
+                text.mark_set(f"pair_{identity}_en", runs[0][0])
+        if reading_removed:
             text.mark_set("reading_position", position)
             if anchor:
                 identity, offset = anchor

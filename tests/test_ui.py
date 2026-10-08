@@ -1,3 +1,4 @@
+import gc
 import json
 import sys
 import threading
@@ -26,6 +27,8 @@ def app(tmp_path):
 
     from realtime_subtitles.ui import SubtitleApp, enable_dpi_awareness
 
+    # Reclaim previous Tk fixtures on the UI thread before starting new workers.
+    gc.collect()
     enable_dpi_awareness()
     root = tk.Tk()
     errors = []
@@ -341,7 +344,8 @@ def test_revision_merge_preserves_reader_and_newer_response_wins(app):
     content = text.get("1.0", "end")
     assert "古い再構成訳。" not in content and "新しい再構成訳。" in content
     assert content.count("Sentence number 15.") == 1
-    assert "Sentence number 14. Sentence number 15. Sentence number 16." in content
+    assert "Sentence number 15. Sentence number 16." in content
+    assert content.count("Sentence number 14.") == 1
 
 
 def test_semantic_paragraphs_can_split_inside_old_units_and_keep_reading_anchor(app):
@@ -371,20 +375,16 @@ def test_semantic_paragraphs_can_split_inside_old_units_and_keep_reading_anchor(
     text.yview(run)
     app.pump()
     assert "number 15." in text.get("@0,0", "@0,0 lineend")
-    h.reconstructions.set_paragraphs(
-        b.unit_id,
-        (
-            ReconstructedParagraph(0, cut - 1, "新しい前半。"),
-            ReconstructedParagraph(cut, len(b.en_text), "新しい後半。"),
-        ),
-    )
-    h.reconstructions.update_translation(b.unit_id, "completed", text="新しい前半。新しい後半。")
+    b = h.reconstructions.prepare(b.unit_id)
+    assert b.en_text == "number 15. Sentence number 16."
+    complete_revision(h, b, "新しい後半。")
     app.pump()
     assert "number 15." in text.get("@0,0", "@0,0 lineend")
     content = text.get("1.0", "end")
     assert content.count("Sentence number 14.") == 1
     assert content.count("number 15.") == 1
     assert "新しい後半。\nnumber 15. Sentence number 16." in content
+    assert "最初の部分。" in content  # Prefix JA was never sent or replaced.
 
 
 def complete_revision(history, target, japanese):
@@ -544,3 +544,45 @@ def test_native_settings_and_subtitles_on_separate_displays(app):
                 y = widget.winfo_rooty() - settings.winfo_rooty()
                 assert 0 <= x <= settings.winfo_width() - widget.winfo_width()
                 assert 0 <= y <= settings.winfo_height() - widget.winfo_height()
+
+
+def test_tail_replacement_keeps_prefix_widget_anchor_and_live_frame(app):
+    from realtime_subtitles.history_reconstruction import ReconstructedParagraph
+
+    h = app.client.history
+    units = [make_unit(h, event(f"Sentence {i}.", i), "s") for i in range(15)]
+    units.append(make_unit(h, event("Keep this prefix. With our", 15), "s"))
+    a = h.reconstructions.plan(units[-1])
+    cut = a.en_text.index("With our")
+    h.reconstructions.set_paragraphs(
+        a.unit_id,
+        (
+            ReconstructedParagraph(0, cut - 1, "変更しない前半。"),
+            ReconstructedParagraph(cut, len(a.en_text), "当社の"),
+        ),
+    )
+    h.reconstructions.update_translation(a.unit_id, "completed", text="変更しない前半。当社の")
+    h.set_partial("new platform", "S1")
+    app.pump()
+    widget, y = app.history_text, app.live_text.winfo_y()
+    prefix_mark = "prefix_probe"
+    widget.mark_set(prefix_mark, app._history_english_runs[15][0][0])
+    before = widget.get(prefix_mark, f"{prefix_mark} lineend")
+    u = make_unit(h, event("new platform 🚀.", 16), "s")
+    h.set_partial("Next live partial", "S1")
+    b = h.reconstructions.plan(u)
+    assert b.en_text == "With our new platform 🚀."
+    complete_revision(h, b, "当社の新しい基盤。")
+    app.pump()
+    text = widget.get("1.0", "end")
+    assert text.count("変更しない前半。") == 1
+    assert text.count("Keep this prefix.") == 1
+    assert text.count("With our") == 1
+    assert "当社の新しい基盤。\nWith our new platform 🚀." in text
+    assert widget.get(prefix_mark, f"{prefix_mark} lineend") == before
+    assert app.history_text is widget and app.live_text.winfo_y() == y
+    assert app.live_text.cget("text") == "Next live partial"
+    h.update_translation(u.unit_id, "completed", text="古い単独訳")
+    app.pump()
+    assert "古い単独訳" not in widget.get("1.0", "end")
+    assert h.saved_text().count("With our") == 1
