@@ -152,6 +152,7 @@ def test_audio_latency_estimate_is_distinct_from_receive_time():
     assert source.estimated_audio_end_monotonic_ms == 7000
     a = TranslationUnitAssembler(h.emit_unit, clock=h.clock)
     a.accept(source)
+    a.flush("eos")
     (unit,) = h.segments()
 
     class Translator:

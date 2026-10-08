@@ -103,6 +103,8 @@ class LiveClient:
             segment = event.get("segment") or {}
             text = segment.get("transcript")
             if isinstance(text, str):
+                if text.strip():
+                    self.assembler.note_speaker(segment.get("speaker"), sm.session_id)
                 self.history.set_partial(text, segment.get("speaker"))
         elif event.get("message") == "AddSegment":
             source = self.history.record_segment(event, sm.session_id)
@@ -215,7 +217,6 @@ class LiveClient:
             capture_started = True
             while not self.stop_requested.is_set():
                 self.mic.check_health()
-                self.assembler.tick()
                 self._dispatch()
                 if not self.speechmatics.active:
                     raise RuntimeError("Speechmatics stopped")
@@ -239,7 +240,8 @@ class LiveClient:
         finally:
             self.state = State.STOPPING
             self.playback_state = "Stopping / Draining"
-            self.assembler.flush("stopping")
+            if not eof:
+                self.assembler.flush("stopping")
             try:
                 if self.mic:
                     self.mic.stop()

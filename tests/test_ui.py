@@ -263,3 +263,35 @@ def test_late_ja_preserves_reading_position_inside_its_own_english(app):
     app.pump()
     assert text.get("@0,0", "@0,0 lineend") == before
     assert text.get("pair_15_en", "pair_15_en lineend") == "Reading sentence 15."
+
+
+def test_final_pair_is_held_live_and_moves_as_a_whole_on_next_partial(app):
+    h, assembler = app.client.history, app.client.assembler
+    now = [time.monotonic()]
+    assembler.clock = lambda: now[0]
+    assembler.accept(h.record_segment(event("One complete sentence.", 0), "s"))
+    app.pump()
+    assert app.live_text.cget("text") == "One complete sentence."
+    assert not app.history_text.get("1.0", "end").strip()
+    now[0] += 3600
+    app.pump()
+    assert not h.segments() and app.live_text.cget("text") == "One complete sentence."
+    h.set_partial("And another", "S1")
+    app.pump()
+    assert "One complete sentence. And another" == app.live_text.cget("text").replace("\n", " ")
+    assembler.accept(h.record_segment(event("And another.", 2), "s"))
+    h.set_partial("")
+    app.pump()
+    assert h.segments()[0].source_segment_ids == (0, 1)
+    assert not app.history_text.get("1.0", "end").strip()
+    h.update_translation(0, "completed", text="完結した文と、もう一文。")
+    now[0] += 3600
+    app.pump()
+    assert app.ja_text.cget("text") == "完結した文と、もう一文。"
+    assert not app.history_text.get("1.0", "end").strip()
+    h.set_partial("Next pair", "S1")
+    app.pump()
+    assert app.live_text.cget("text") == "Next pair" and not app.ja_text.cget("text")
+    assert "完結した文と、もう一文。\nOne complete sentence. And another." in app.history_text.get(
+        "1.0", "end"
+    )

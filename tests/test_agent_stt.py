@@ -44,11 +44,13 @@ def test_low_level_word_finals_cannot_create_translation_jobs():
     assert not submitted
     for i in range(7):
         client._receive(agent_event(f"Entire server sentence {i}.", i * 2), ())
-    assert len(submitted) == 7 and all(isinstance(x, TranslationUnit) for x in submitted)
+    assert len(submitted) == 3 and all(isinstance(x, TranslationUnit) for x in submitted)
     assert len(client.history.word_metadata) == 2000
-    assert [x["text"] for x in client.history.context_for(6)] == [
-        f"Entire server sentence {i}." for i in range(1, 6)
+    assert [x["text"] for x in client.history.context_for(2)] == [
+        f"Entire server sentence {i}. Entire server sentence {i + 1}." for i in (0, 2)
     ]
+    client._session_changed(None)
+    assert len(submitted) == 4 and submitted[-1].source_segment_ids == (6,)
     assert not hasattr(submitted[0], "words")
     assert client.history.display_snapshot()[3] == ""
 

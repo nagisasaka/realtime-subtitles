@@ -66,7 +66,7 @@ def test_final_unit_context_speakers_and_authoritative_text():
     assert h.segments()[7].ja_text == "一文目。二文目の断片"
 
 
-def test_only_final_triggers_translation_partial_replaces():
+def test_only_final_pair_triggers_translation_partial_replaces():
     client = LiveClient()
     client.speechmatics = SimpleNamespace(history=SegmentHistory(), session_id="s")
     jobs = []
@@ -80,8 +80,12 @@ def test_only_final_triggers_translation_partial_replaces():
     final = event("The biggest challenge is reliability.")
     for _ in range(2):
         client._receive(final, ())
-    assert len(jobs) == 1 and jobs[0].en_text == final["segment"]["transcript"]
+    assert not jobs  # duplicate AddSegment does not count as a second final
     assert client.history.display_snapshot()[3] == ""
+    client._receive(event("In production.", 1), ())
+    assert len(jobs) == 1
+    assert jobs[0].en_text == final["segment"]["transcript"] + " In production."
+    assert jobs[0].source_segment_ids == (0, 1)
     client._session_changed(None)
     assert len(client.history.segments()) == 1
 
@@ -627,3 +631,31 @@ def test_held_final_is_visible_before_translation_and_validation_error_is_marked
             root.destroy()
         except tk.TclError:
             pass
+
+
+def test_pair_wait_survives_silence_and_known_speaker_partial_flushes_remaining():
+    now = [10.0]
+    h = FinalHistory(clock=lambda: now[0])
+    client = LiveClient(history=h)
+    client.speechmatics = SimpleNamespace(session_id="s")
+    jobs = []
+    client.translation = SimpleNamespace(submit=jobs.append)
+    client._receive(event("One complete sentence.", 0), ())
+    held = h.subtitle_view()
+    now[0] += 1000
+    assert not jobs and h.subtitle_view() == held
+    client._receive(event("Continuation", 1, final=False), ())
+    assert h.subtitle_view().en_text == "One complete sentence. Continuation"
+    assert not jobs
+    client._receive(event("Continuation.", 1), ())
+    assert len(jobs) == 1 and jobs[0].source_segment_ids == (0, 1)
+    assert h.subtitle_view().history_latest_id == -1
+    client._receive(event("Third final.", 2), ())
+    assert h.subtitle_view().history_latest_id == 0 and len(jobs) == 1
+    client._receive(event("Someone else", 3, "S2", final=False), ())
+    assert len(jobs) == 2 and jobs[1].en_text == "Third final."
+    assert h.subtitle_view().en_text == "Someone else"
+    assert h.subtitle_view().history_latest_id == 1
+    client._receive(event("Someone else.", 3, "S2"), ())
+    client.stop()
+    assert len(jobs) == 3 and jobs[-1].source_segment_ids == (3,)

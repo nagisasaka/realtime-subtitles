@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from realtime_subtitles.translation_assembler import TranslationUnitAssembler, is_complete
+from realtime_subtitles.translation_assembler import TranslationUnitAssembler
 from realtime_subtitles.translation_history import TranslationHistory
 
 
@@ -68,27 +68,18 @@ def test_real_fragments_join_and_preserve_sources(parts):
         "It costs 3.14.",
     ],
 )
-def test_complete_immediate(text):
-    _, h, _, feed = harness()
-    feed(text)
-    assert h.segments()[0].assembler_hold_ms == 0
-
-
-@pytest.mark.parametrize("text", ["Dr.", "e.g.", "Prof.", "The price is 3.14", "The U.S."])
-def test_abbreviations_and_decimal_not_sentence(text):
-    assert not is_complete(text)
-
-
-def test_deadline_never_extends_and_timer_flushes():
+def test_even_complete_sentences_wait_for_second_final(text):
     clock, h, a, feed = harness()
-    feed("It")
-    clock.value += 1
-    feed("is", 1, 1.2)
-    clock.value += 0.5
-    a.tick()
+    feed(text)
+    before = h.subtitle_view()
+    clock.value += 600  # Time/silence never emits or moves the displayed English.
+    assert not h.segments() and h.subtitle_view() == before
+    assert a.snapshot()["waiting_for"] == "next_final"
+    feed("Another sentence.", 100, 103)
     (unit,) = h.segments()
-    assert unit.en_text == "It is" and unit.assembler_hold_ms == 1500
-    assert unit.assembly_reason == "timeout"
+    assert unit.en_text == text + " Another sentence."
+    assert unit.source_segment_ids == (0, 1)
+    assert unit.assembly_reason == "final_pair"
 
 
 @pytest.mark.parametrize(
@@ -97,8 +88,6 @@ def test_deadline_never_extends_and_timer_flushes():
         {"speaker": "S2"},
         {"session": "b"},
         {"speaker": "UU"},
-        {"start": 1.601},
-        {"start": 0.9},
     ],
 )
 def test_boundaries_prevent_join(kwargs):
@@ -106,8 +95,10 @@ def test_boundaries_prevent_join(kwargs):
     feed("The landscape is")
     clock.value += 0.1
     feed("changing.", **({"start": 1, "end": 2} | kwargs))
-    assert len(h.segments()) == 2
+    assert len(h.segments()) == 1
     assert h.segments()[0].source_segment_ids == (0,)
+    assert [s.segment_id for s in a.pending] == [1]
+    a.flush("eos")
     assert h.segments()[1].source_segment_ids == (1,)
 
 
@@ -120,20 +111,44 @@ def test_flush_retains_pending(reason):
     assert len(h.segments()) == 1 and h.segments()[0].assembly_reason == reason
 
 
-def test_safety_limits_and_unknown_speaker():
+def test_unknown_speaker_and_session_do_not_merge():
+    for kwargs in ({"speaker": "UU"}, {"speaker": None}, {"session": None}):
+        _, h, a, feed = harness()
+        feed("Unknown.", **kwargs)
+        feed("Continuation.", 1, 2, **kwargs)
+        a.flush("eos")
+        assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]
+
+
+def test_punctuation_and_long_audio_gap_do_not_split_pairs():
     _, h, a, feed = harness()
-    feed("a" * 2001)
-    assert not a.pending
-    feed("long audio", 1, 32)
-    assert not a.pending
-    feed("unknown", 32, 33, speaker="UU")
-    feed("continuation.", 33, 34, speaker="UU")
-    assert len(h.segments()) == 4
+    for i, text in enumerate(["Yes.", "Dr.", "Price 3.14", "Done!", "Odd remaining."]):
+        feed(text, i * 80, i * 80 + 60)
+    assert [u.source_segment_ids for u in h.segments()] == [(0, 1), (2, 3)]
+    assert [s.segment_id for s in a.pending] == [4]
+    a.flush("eos")
+    assert h.segments()[-1].source_segment_ids == (4,)
 
 
-def test_unknown_session_never_merges_even_with_matching_speaker():
-    clock, h, _, feed = harness()
-    feed("The landscape is", session=None)
-    clock.value += 0.4
-    feed("changing.", 1, 1.4, session=None)
-    assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]
+def test_speaker_partial_flushes_only_on_known_change_and_does_not_translate_partial():
+    _, h, a, feed = harness()
+    feed("Waiting.")
+    a.note_speaker("S1", "a")
+    a.note_speaker("UU", "a")
+    assert not h.segments()
+    a.note_speaker("S2", "a")
+    assert len(h.segments()) == 1 and h.segments()[0].en_text == "Waiting."
+    assert h.segments()[0].assembly_reason == "speaker_boundary"
+    a.note_speaker("S2", "a")
+    assert len(h.segments()) == 1
+
+
+def test_context_counts_pairs_and_keeps_original_sources():
+    _, h, a, feed = harness()
+    for i in range(12):
+        feed(f"Final {i}.", i, i + 1)
+    assert len(h.segments()) == 6
+    assert h.context_for(5) == [
+        {"speaker": "S1", "text": f"Final {i}. Final {i + 1}."} for i in range(0, 10, 2)
+    ]
+    assert len(h.sources()) == 12 and not a.pending

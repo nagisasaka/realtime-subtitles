@@ -119,3 +119,32 @@ def test_frame_clear_and_session_keep_old_translations_out_of_history():
     make_unit(h, event("New."), "new")
     view, changes, _, _ = h.subtitle_frame(cursor)
     assert view.en_text == "New." and len(changes) == 1
+
+
+def test_two_finals_remain_one_live_unit_until_next_partial_without_deadline():
+    now = [10.0]
+    h = TranslationHistory(clock=lambda: now[0])
+    a = TranslationUnitAssembler(h.emit_unit, clock=h.clock)
+    first = h.record_segment(event("The landscape is."), "one")
+    a.accept(first)
+    initial = h.subtitle_view()
+    now[0] += 3600
+    assert h.subtitle_view() == initial and not h.segments()
+    h.set_partial("Changing", "S1")
+    assert h.subtitle_view().en_text == "The landscape is. Changing"
+    h.set_partial("Changing quickly.", "S1")
+    assert h.subtitle_view().en_text == "The landscape is. Changing quickly."
+    second = h.record_segment(event("Changing quickly.", 60), "one")
+    h.set_partial("")
+    a.accept(second)
+    paired = h.subtitle_view()
+    assert paired.en_text == "The landscape is. Changing quickly."
+    assert paired.unit_id == 0 and paired.history_latest_id == -1
+    now[0] += 3600
+    h.update_translation(0, "completed", text="状況は急速に変化しています。")
+    assert h.subtitle_view().en_text == paired.en_text
+    assert h.subtitle_view().history_latest_id == -1
+    h.set_partial("Next thought", "S1")
+    assert h.subtitle_view().en_text == "Next thought"
+    assert h.subtitle_view().history_latest_id == 0
+    assert not h.subtitle_view().ja_text

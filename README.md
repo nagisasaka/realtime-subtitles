@@ -9,7 +9,7 @@ Windows microphone (sounddevice、1デバイスのみ) / Audio File (PCM16 WAV�
   → 16 kHzへ送信workerで変換（24 kHz PCMは別workerでWAV保存）
   → Speechmatics Agent STT linden-1 (en / partials / speaker / emit_sentences)
       ├─ Partial EN → 現在の未確定部分を置換表示
-      └─ AddSegment → bounded Assembler → TranslationUnit / source_segment_ids / speaker / timestamps
+      └─ AddSegment → 2-final Assembler（時間制限なし） → TranslationUnit / source_segment_ids / speaker / timestamps
                       → bounded queue → OpenAI Responses API × 最大4並列
                           gpt-6-luna / reasoning.effort=none
                       → 同じTranslationUnitのJA欄へ追加
@@ -138,8 +138,9 @@ WindowsのWF-1000XM6出力で、3秒でStop→同じWAVを12秒再StartしてEOF
 単語単位のルビではなく、TranslationUnit単位の対応です。日本語用2行＋英語用2行の領域を
 確保するため、訳が遅れて届いても最新英文の画面位置は変わりません。
 
-- 最新EN partialは33ms周期で最新値へ置換。未完結の確定segmentと続きのpartialは一緒に表示します。
-- 確定後も最新枠に残し、**次の発話が始まった時点で**直下の履歴へ移します。
+- 最新EN partialは33ms周期で最新値へ置換。1件目の確定segmentと続きのpartialは一緒に表示します。
+- 2件目のfinalで翻訳単位が確定しても最新枠に残し、**次のpartial（またはpartialなしの次のfinal）が来た時点で**丸ごと履歴へ移します。
+  無音・時間経過・日本語訳の到着だけでは履歴へ移しません。
 - 履歴は**上ほど新しく、下ほど古い**英日ペア。各英文の上に対応する小さい日本語訳を置きます。
 - ウィンドウを縦に広げると見える履歴が増えます。ホイール／スクロールバーでさらに過去を読めます。
   履歴の閲覧中も最上部の最新枠は更新します。新着や上側の訳更新で閲覧位置を戻しません。
@@ -215,14 +216,17 @@ WAVデコードは標準ライブラリなので、新たなデコーダDLL・�
 ## 翻訳単位・文脈・話者
 
 **AddSegmentはraw確定ENとして即座に保存・表示し、TranslationUnitは別に組み立てます。**
-完結したsegmentは即時、未完結だけ最初の受信から最大1.5秒保留します。
-同session・既知の同speaker・音声gap 0〜600msの続きだけを結合します。
-話者/session変更・Stop/EOS/切断・期限でflushし、期限は延長しません。
-結合上限は2000文字・音声30秒・20segment。受信した単独segmentは上限超過でも切らずに即送信します。
+同じ認識session・既知の同speakerの**finalを2件ずつ**結合して、Lunaへ1回のTARGETとして送ります。
+句読点・文の完結判定・音声gap・1.5秒タイマーによるflushは廃止しました。
+1件目だけで無音になった場合は期限なしで待ちます。英語はそのまま表示し、日本語はまだ要求しません。
+既知の別speakerのpartial／final、session変更、Stop、EOS、切断では残り1件をflushします。
+話者不明（UU/SU等）やsession不明のfinal同士は同一話者と推定せず、次のfinal／終了時に単独unitとして扱います。
+保留件数は最大1件、送出unitは最大2件のraw segmentです。時間による独自の字幕移動はありません。
+EOFではサーバーの最後のfinalを回収してから残りをflushし、未完了の翻訳を既存の上限内でdrainします。
 rawの`segment.transcript`を維持し、結合時は自然な単語間スペースでつなぎ、`segment.speaker`と`metadata.start_time/end_time`を保持します。
 `AddPartialSegment`は前のpartialを置換する英語ライブ表示専用です。
 `AddTranscript` / word / 低レベルfinalは翻訳のトリガーにしません。
-サーバーの`emit_sentences=true`は維持し、不完全なsegmentのみ軽量Assemblerで短時間結合します。
+サーバーの`emit_sentences=true`とLinden 1の設定、翻訳validator／最大1回の品質retryは維持します。
 非推奨Realtime Voice SDKは使わず、`speechmatics-agent-stt`を使用します。
 
 直前最大5件のTranslationUnitの確定英語とspeakerをCONTEXTへ渡します。
@@ -265,14 +269,27 @@ TXTと手動保存の最終unit一覧は発話順です。保留中のraw ENも�
 
 遅延の定義:
 
-- `assembler_hold_ms`: 結合元の最初のAddSegment受信からunit確定まで。完結segmentは即時、未完結は設定上1500ms。実スレッドの約10msのtick・OS schedulingにより期限直後になる場合があります。
+- `assembler_hold_ms`: 結合元の最初のAddSegment受信からunit確定まで。2件目のfinalまたは話者／終了境界までの待ち時間で、時間上限はありません。API応答待ち時間とは別です。
 - `translation_latency_ms`: API待機時間の合計。retry分を含み、queue待ち・assembler・検証は含みません。
 - `validation_latency_ms`: ローカル検証に要した時間の合計。
 - `queue_wait_ms`: unit確定から翻訳worker開始まで。
 - `end_to_end_ja_latency_ms`: **最初のAddSegment受信**からJAの確定／失敗判定まで。音声終了からの時間やTk描画完了時刻ではありません。
 - `audio_end_to_end_ja_latency_ms`: 最初のPCM capture終了時刻とsample数から推定したsession音声原点＋最後のsourceのend_msを基準とする推定値。デバイス／resampler遅延は未較正で、queue欠落が分かれば利用不可にします。
 
-## 結合・検証の動作確認（2026-10-07）
+## 2-final結合の動作確認（2026-10-07）
+
+タイマーを使わず、同話者のfinal 2件を1 unitへまとめる実装をWindowsで確認しました。
+既存講演WAVで途中Stop→再Start→12秒EOFを実行。完走側の4 raw finalsは2 unitsとなり、
+2件目を待った時間は1,971ms／4,046msでした。途中停止側の残り1件も含めて3 unitsの日本語が確定しました。
+Tk/APIエラー0、最新ENのY位置97pxとウィンドウ高さ550pxは観測中一定でした。
+この短い確認だけで翻訳品質の改善を断定するものではありません。
+
+WSL 182件成功（Windows等9件skip）、Windows 165件成功（1件skip）。
+時計を1時間進めても1件目が移動しないこと、句読点・音声gapによらず2件結合すること、
+話者／sessionをまたがないこと、次partialでペア全体を履歴へ移すこと、
+EOFの最後のfinalとの結合・Stop時の残り1件・再Start・原文保存をテストしています。
+
+## 旧1.5秒結合・検証の動作確認（2026-10-07）
 
 Windows Python 3.14で既存講演WAVを合計75秒再生し、Start → Stop → Startを実行。
 新規マイク録音なし。Linden 1 → Luna → Tk表示で29 unitすべて確定、音声drop 0、Tkエラー0。

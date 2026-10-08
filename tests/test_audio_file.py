@@ -196,6 +196,16 @@ def test_file_uses_production_pipeline_eos_restart_and_metadata(
                     count += 1
                     data.extend(message)
                     await ws.send(json.dumps({"message": "AudioAdded", "seq_no": count}))
+                    if count == 1:
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "message": "AddSegment",
+                                    "metadata": {"start_time": 0, "end_time": 0.2},
+                                    "segment": {"speaker": "S1", "transcript": "Beginning."},
+                                }
+                            )
+                        )
                 else:
                     eos = json.loads(message)
                     assert eos["message"] == "EndOfStream" and eos["last_seq_no"] == count
@@ -205,7 +215,7 @@ def test_file_uses_production_pipeline_eos_restart_and_metadata(
                         json.dumps(
                             {
                                 "message": "AddSegment",
-                                "metadata": {"start_time": 0, "end_time": 0.45},
+                                "metadata": {"start_time": 0.2, "end_time": 0.45},
                                 "segment": {"speaker": "S1", "transcript": "Last final."},
                             }
                         )
@@ -232,6 +242,8 @@ def test_file_uses_production_pipeline_eos_restart_and_metadata(
                 assert client.playback_state == "Finished", client.snapshot()
                 assert client.snapshot()["position_ms"] == 450
             assert len(endings) == 2 and len(calls) == 2
+            assert all(unit.en_text == "Beginning. Last final." for unit, _ in calls)
+            assert all(len(unit.source_segment_ids) == 2 for unit, _ in calls)
             assert len(monitors) == (2 if monitor_enabled else 0)
             assert all(m.error and not m.thread.is_alive() for m in monitors)
 
