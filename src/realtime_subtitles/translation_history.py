@@ -82,6 +82,7 @@ class TranslationHistory:
         self._display_start = 0
         self._partial = ""
         self._partial_speaker = None
+        self._advanced_unit_id = -1
         self._session = None
         self._last_speaker = None
         self.context_segments = max(0, context_segments)
@@ -119,6 +120,10 @@ class TranslationHistory:
 
     def set_partial(self, text, speaker=None):
         with self._lock:
+            if text and self._segments:
+                last = self._segments[-1]
+                if last.source_segment_ids[-1] == len(self._sources) - 1:
+                    self._advanced_unit_id = last.unit_id
             if (self._partial, self._partial_speaker) != (text, speaker):
                 self._partial, self._partial_speaker = text, speaker
                 self._revision += 1
@@ -297,7 +302,28 @@ class TranslationHistory:
                 unit = None
             after = unit.source_segment_ids[-1] + 1 if unit else self._display_start
             pending = self._sources[max(after, len(self._sources) - 20) :]
-            return project_subtitles(unit, pending, self._partial, self._partial_speaker)
+            return project_subtitles(
+                unit, pending, self._partial, self._partial_speaker, self._advanced_unit_id
+            )
+
+    def subtitle_frame(self, cursor):
+        """Atomic live projection + changed units since the previous UI frame.
+
+        Unit objects are immutable. Partial updates never copy/scan old transcript
+        history. The UI can amend only affected bilingual pairs in its Text widget.
+        """
+        with self._lock:
+            ids = dict.fromkeys(
+                row["translation_unit_id"]
+                for row in self._journal[cursor:]
+                if row["kind"] == "translation_unit"
+            )
+            changed = tuple(
+                self._segments[i]
+                for i in ids
+                if self._segments[i].source_segment_ids[0] >= self._display_start
+            )
+            return self.subtitle_view(), changed, len(self._journal), self._display_start
 
     def display_snapshot(self):
         with self._lock:

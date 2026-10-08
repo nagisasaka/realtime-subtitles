@@ -18,7 +18,8 @@ class Settings:
     audio_monitor: bool = False
     geometry: str = ""
     english_size: int = 30
-    japanese_size: int = 29
+    japanese_size: int = 18
+    subtitle_layout_version: int = 2
     english_weight: str = "bold"
     japanese_weight: str = "normal"
     transparency: int = 25
@@ -39,6 +40,13 @@ class Settings:
                 setattr(result, field.name, value)
         result.english_size = max(8, min(64, result.english_size))
         result.japanese_size = max(8, min(64, result.japanese_size))
+        version = data.get("subtitle_layout_version", 1)
+        if not isinstance(version, int) or version < 2:
+            # The previous UI used Japanese as a full-size standalone caption.
+            result.japanese_size = max(
+                8, min(result.japanese_size, round(result.english_size * 0.6))
+            )
+        result.subtitle_layout_version = 2
         result.transparency = max(0, min(70, result.transparency))
         if result.english_weight not in {"normal", "bold"}:
             result.english_weight = "bold"

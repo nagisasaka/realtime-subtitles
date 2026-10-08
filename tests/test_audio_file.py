@@ -239,7 +239,7 @@ def test_file_uses_production_pipeline_eos_restart_and_metadata(
             assert audio[0] == audio[1]
             assert all(context == [] for _, context in calls)
             assert client.history.statistics() == {"completed": 2}
-            assert client.history.subtitle_view().confirmed_unit_id == 1
+            assert client.history.subtitle_view().unit_id == 1
             rows, _ = client.history.autosave_updates(0)
             sessions = [r for r in rows if r["kind"] == "input_session"]
             assert len(sessions) == 2

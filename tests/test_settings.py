@@ -46,3 +46,15 @@ def test_corrupt_and_out_of_range_settings(tmp_path):
     assert settings.always_on_top is True
     assert settings.geometry == "" and settings.microphone == ""
     assert settings.input_source == "microphone"
+
+
+def test_ruby_layout_migrates_old_ja_size_once(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"english_size": 30, "japanese_size": 29}))
+    settings = Settings.load(path)
+    assert settings.japanese_size == 18
+    settings.japanese_size = 22
+    settings.save(path)
+    assert Settings.load(path).japanese_size == 22
+    path.write_text(json.dumps({"subtitle_layout_version": "broken"}))
+    assert Settings.load(path).subtitle_layout_version == 2

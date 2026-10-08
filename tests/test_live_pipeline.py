@@ -434,8 +434,8 @@ def test_overlay_final_translation_replacement_and_fixed_view(tmp_path):
         pump()
         client.history.set_partial("The biggest challenge")
         pump()
-        assert app.partial_text.cget("text") == "The biggest challenge"
-        assert not app.en_text.cget("text")
+        assert app.live_text.cget("text") == "The biggest challenge"
+        assert not app.ja_text.cget("text")
         first = make_unit(client.history, event("The biggest challenge", 0), "s")
         client.history.set_partial("")
         second = make_unit(client.history, event("Next speaker.", 1, "S2"), "s")
@@ -445,7 +445,7 @@ def test_overlay_final_translation_replacement_and_fixed_view(tmp_path):
         client.history.update_translation(first.sequence_id, "completed", text="最大の課題")
         pump()
         assert app.ja_text.cget("text") == "次の話者。"
-        assert not app.partial_text.cget("text")
+        assert app.live_text.cget("text") == "Next speaker."
         for i in range(2, 70):
             s = make_unit(client.history, event(f"Line {i}.\n", i), "s")
             if i > 2:
@@ -458,7 +458,7 @@ def test_overlay_final_translation_replacement_and_fixed_view(tmp_path):
         assert app.ja_text.cget("text") == visible
         client.history.clear_display()
         pump()
-        assert not app.en_text.cget("text")
+        assert not app.live_text.cget("text")
         assert len(client.history.segments()) == 70 and not errors
     finally:
         app.close()
@@ -595,10 +595,10 @@ def test_held_final_is_visible_before_translation_and_validation_error_is_marked
         client.assembler.accept(first)
         pump()
         assert not submitted and not history.segments()
-        assert "The landscape is" in app.en_text.cget("text")
+        assert "The landscape is" in app.live_text.cget("text")
         history.set_partial("changing", "S1")
         pump()
-        assert app.partial_text.cget("text") == "changing"
+        assert app.live_text.cget("text") == "The landscape is changing"
         now[0] += 0.4
         second = history.record_segment(event("changing.", 1), "session")
         history.set_partial("")
@@ -614,7 +614,7 @@ def test_held_final_is_visible_before_translation_and_validation_error_is_marked
         pump()
         assert "翻訳検証エラー" in app.ja_text.cget("text")
         assert "bad candidate" not in app.ja_text.cget("text")
-        assert "changing." in app.en_text.cget("text")
+        assert "changing." in app.live_text.cget("text")
         assert [s.en_text for s in history.sources()] == ["The landscape is", "changing."]
         assert not errors
     finally:

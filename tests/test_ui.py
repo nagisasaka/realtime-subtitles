@@ -69,10 +69,10 @@ def test_fixed_widgets_coalescing_partial_correction_long_lines(app):
     app.pump()
     assert app._render_count - previous <= 2
     assert (
-        app.partial_text.cget("text").replace("\n", " ")
+        app.live_text.cget("text").replace("\n", " ")
         == "I think the biggest problem is reliability in production"
     )
-    assert "incorrect" not in app.partial_text.cget("text")
+    assert "incorrect" not in app.live_text.cget("text")
     app.client.history.set_partial("Very long live statement with many words. " * 100)
     u = make_unit(
         app.client.history, event("A long confirmed statement with many words. " * 100), "s"
@@ -81,7 +81,7 @@ def test_fixed_widgets_coalescing_partial_correction_long_lines(app):
     app.pump()
     assert dict(app.caption_widgets) == widgets
     for key, w in widgets.items():
-        assert len(w.cget("text").splitlines()) <= (1 if key == "confirmed" else 2)
+        assert len(w.cget("text").splitlines()) <= 2
         assert (w.winfo_y(), w.winfo_height()) == bounds[key]
         assert w.winfo_class() == "Label"  # no Text scroll buffer
     assert app.root.winfo_height() == height
@@ -106,7 +106,7 @@ def test_controls_fonts_dpi_drag_clickthrough_and_missing_file(app, tmp_path):
     app.pump()
     assert app.en_font.cget("size") == -round(32 * app.scale)
     assert app.ja_font.cget("weight") == "normal"
-    assert app.partial_text.winfo_height() == app.en_font.metrics("linespace") * 2
+    assert app.live_text.winfo_height() == app.en_font.metrics("linespace") * 2
     app.transparency.set(40)
     app._transparency_changed(40)
     assert abs(app.root.attributes("-alpha") - 0.6) < 0.01
@@ -174,8 +174,10 @@ def test_save_remains_nonmodal_and_late_ja_does_not_replace_current(app, tmp_pat
         h.update_translation(first.unit_id, "completed", text="過去の質問。")
         h.set_partial("New live words")
         app.pump()
-        assert app.ja_text.cget("text") == "現在の回答。"
-        assert app.partial_text.cget("text") == "New live words"
+        assert app.ja_text.cget("text") == ""
+        assert "現在の回答。" in app.history_text.get("1.0", "end")
+        assert "過去の質問。" in app.history_text.get("1.0", "end")
+        assert app.live_text.cget("text") == "New live words"
         release.set()
         deadline = time.monotonic() + 3
         while app.saving and time.monotonic() < deadline:
@@ -188,3 +190,76 @@ def test_save_remains_nonmodal_and_late_ja_does_not_replace_current(app, tmp_pat
         assert "同名" in app.save_result.get()
     finally:
         release.set()
+
+
+def test_reverse_history_ruby_late_ja_scroll_anchor_and_live_hold(app):
+    h = app.client.history
+    units = []
+    for i in range(30):
+        units.append(make_unit(h, event(f"Sentence number {i}.", i), "s"))
+    app.pump()
+    assert app.live_text.cget("text") == "Sentence number 29."
+    text = app.history_text
+    content = text.get("1.0", "end")
+    assert content.index("number 28") < content.index("number 27")
+    assert "number 29" not in content
+    bounds = app.live_text.winfo_y(), app.live_text.winfo_height()
+    h.update_translation(29, "completed", text="29番の文。")
+    app.pump()
+    assert app.ja_text.winfo_y() < app.live_text.winfo_y()
+    assert app.ja_text.cget("text") == "29番の文。"
+    h.set_partial("New speech", "S2")
+    app.pump()
+    assert not app.ja_text.cget("text")
+    assert "29番の文。\nSentence number 29." in text.get("1.0", "end")
+    text.yview("pair_15_start")
+    app.pump()
+    anchor = text.get("@0,0", "@0,0 lineend")
+    # Longer late translation above the reader + a newly archived sentence.
+    h.update_translation(25, "completed", text="遅れて届いた長い訳です。" * 12)
+    h.set_partial("")
+    make_unit(h, event("Another final.", 31, "S2"), "s")
+    h.set_partial("Still live", "S2")
+    app.pump()
+    assert text.get("@0,0", "@0,0 lineend") == anchor
+    assert (app.live_text.winfo_y(), app.live_text.winfo_height()) == bounds
+    content = text.get("1.0", "end")
+    assert content.count("Sentence number 25.") == 1
+    assert content.index("長い訳") < content.index("Sentence number 25.")
+    text.yview_moveto(0)
+    app.pump()
+    assert text.yview()[0] == 0
+    h.clear_display()
+    app.pump()
+    assert text.get("1.0", "end").strip() == ""
+    assert len(h.sources()) == 31
+
+
+def test_history_unicode_replacement_does_not_damage_adjacent_pairs(app):
+    h = app.client.history
+    first = make_unit(h, event("First 🚀 sentence."), "s")
+    make_unit(h, event("Second sentence.", 2), "s")
+    h.set_partial("Third")
+    app.pump()
+    h.update_translation(first.unit_id, "completed", text="最初の🚀文。")
+    app.pump()
+    content = app.history_text.get("1.0", "end")
+    assert content.count("First 🚀 sentence.") == 1
+    assert content.count("Second sentence.") == 1
+    assert "最初の🚀文。\nFirst 🚀 sentence." in content
+
+
+def test_late_ja_preserves_reading_position_inside_its_own_english(app):
+    h = app.client.history
+    for i in range(30):
+        make_unit(h, event(f"Reading sentence {i}.", i), "s")
+    app.pump()
+    text = app.history_text
+    text.yview("pair_15_en")
+    app.pump()
+    before = text.get("@0,0", "@0,0 lineend")
+    assert "Reading sentence 15." in before
+    h.update_translation(15, "completed", text="あとから届いた非常に長い日本語訳です。" * 12)
+    app.pump()
+    assert text.get("@0,0", "@0,0 lineend") == before
+    assert text.get("pair_15_en", "pair_15_en lineend") == "Reading sentence 15."

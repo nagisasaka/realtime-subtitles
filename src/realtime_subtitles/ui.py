@@ -17,7 +17,7 @@ from .autosave import TranscriptAutosave
 from .live_client import LiveClient
 from .realtime_api import State
 from .settings import Settings
-from .subtitle_view import wrap_subtitle
+from .subtitle_view import translation_caption, wrap_subtitle
 
 BG = "#111318"
 
@@ -176,6 +176,10 @@ class SubtitleApp:
         self._render_key = None
         self._render_count = 0
         self._caption_layout = {}
+        self._history_cursor = 0
+        self._history_display_start = 0
+        self._history_pending = {}
+        self._history_rendered = set()
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
         if audio_file is not None:
@@ -212,7 +216,7 @@ class SubtitleApp:
 
     def _place_window(self):
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width, height = min(round(1080 * self.scale), screen_w), round(330 * self.scale)
+        width, height = min(round(1080 * self.scale), screen_w), round(520 * self.scale)
         x, y = max(0, (screen_w - width) // 2), max(0, screen_h - height - 80)
         if self.settings.geometry:
             values = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", self.settings.geometry)
@@ -444,9 +448,8 @@ class SubtitleApp:
         )
         self.caption_widgets = {}
         for name, face, color in [
-            ("confirmed", self.confirmed_font, "#bdc5d2"),
-            ("partial", self.en_font, "#ffffff"),
-            ("ja", self.ja_font, "#e9eef6"),
+            ("ja", self.ja_font, "#aeb9cc"),
+            ("live", self.en_font, "#ffffff"),
         ]:
             widget = tk.Label(
                 self.captions,
@@ -462,36 +465,64 @@ class SubtitleApp:
             self.caption_widgets[name] = widget
             widget.bind("<ButtonPress-1>", self._drag_start)
             widget.bind("<B1-Motion>", self._drag_move)
-        self.en_text = self.caption_widgets["confirmed"]
-        self.partial_text = self.caption_widgets["partial"]
+        self.live_text = self.caption_widgets["live"]
         self.ja_text = self.caption_widgets["ja"]
-        self.ja_hint = tk.Label(
-            self.captions,
-            text="確定ENの訳",
-            font=("Yu Gothic UI", -round(12 * self.scale)),
+        self.history_header = tk.Frame(self.captions, bg=BG)
+        tk.Label(
+            self.history_header,
+            text="履歴 · 新しい順",
             bg=BG,
-            fg="#8693a8",
-            anchor="w",
+            fg="#8793a6",
+            font=("Yu Gothic UI", -round(12 * self.scale)),
+        ).pack(side="left")
+        ttk.Button(
+            self.history_header, text="最新へ ↑", command=lambda: self.history_text.yview_moveto(0)
+        ).pack(side="right")
+        self.history_frame = tk.Frame(self.captions, bg=BG)
+        self.history_text = tk.Text(
+            self.history_frame,
+            bg=BG,
+            fg="#dbe2ec",
+            bd=0,
+            highlightthickness=0,
+            wrap="word",
+            state="disabled",
+            cursor="arrow",
             padx=0,
+            pady=0,
+            font=self.confirmed_font,
+            selectbackground="#394556",
+            takefocus=True,
         )
+        scroll = ttk.Scrollbar(self.history_frame, command=self.history_text.yview)
+        self.history_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.history_text.pack(side="left", fill="both", expand=True)
+        self.history_text.tag_configure("ja", font=self.ja_font, foreground="#aeb9cc")
+        self.history_text.tag_configure("en", font=self.confirmed_font, spacing3=12)
+        self.history_text.tag_configure("speaker", foreground="#8793a6", font=("Segoe UI", 9))
         self.captions.bind("<Configure>", lambda _: self._layout_captions())
         self._layout_captions()
 
     def _layout_captions(self):
         width = min(max(1, self.captions.winfo_width()), round(1100 * self.scale))
         x = max(0, (self.captions.winfo_width() - width) // 2)
-        gap = round(12 * self.scale)
-        confirmed = self.confirmed_font.metrics("linespace")
+        gap = round(8 * self.scale)
         live = self.en_font.metrics("linespace") * 2
         ja = self.ja_font.metrics("linespace") * 2
-        hint = round(20 * self.scale)
-        self.en_text.place(x=x, y=0, width=width, height=confirmed)
-        self.partial_text.place(x=x, y=confirmed + gap, width=width, height=live)
-        self.ja_hint.place(x=x, y=confirmed + live + 2 * gap, width=width, height=hint)
-        self.ja_text.place(x=x, y=confirmed + live + 2 * gap + hint, width=width, height=ja)
-        self.root.minsize(
-            round(480 * self.scale), confirmed + live + ja + hint + 2 * gap + round(86 * self.scale)
+        header = round(34 * self.scale)
+        # Translation arrival never changes the live English's screen position.
+        self.ja_text.place(x=x, y=0, width=width, height=ja)
+        self.live_text.place(x=x, y=ja + gap, width=width, height=live)
+        history_y = ja + live + 2 * gap
+        self.history_header.place(x=x, y=history_y, width=width, height=header)
+        self.history_frame.place(
+            x=x,
+            y=history_y + header,
+            width=width,
+            height=max(1, self.captions.winfo_height() - history_y - header),
         )
+        self.root.minsize(round(480 * self.scale), history_y + header + round(160 * self.scale))
         self._render_key = None
         self._caption_layout.clear()
 
@@ -500,36 +531,97 @@ class SubtitleApp:
         self.settings_window.lift()
         return "break"
 
+    def _update_history_pairs(self, view, changed, display_start):
+        text = self.history_text
+        reset = self._history_display_start != display_start
+        if reset:
+            self._history_display_start = display_start
+            self._history_pending.clear()
+            self._history_rendered.clear()
+        self._history_pending.update((u.unit_id, u) for u in changed)
+        ready = [u for i, u in self._history_pending.items() if i <= view.history_latest_id]
+        if not ready and not reset:
+            return
+        # A mark follows inserts above the reader, including late translations.
+        at_top = text.yview()[0] < 0.00001
+        text.mark_set("reading_position", "@0,0")
+        text.mark_gravity("reading_position", "right")
+        text.configure(state="normal")
+        if reset:
+            text.delete("1.0", "end")
+            for mark in text.mark_names():
+                if mark.startswith("pair_"):
+                    text.mark_unset(mark)
+            at_top = True
+        for unit in sorted(ready, key=lambda u: u.unit_id):
+            identity = unit.unit_id
+            begin = f"pair_{identity}_start"
+            ja_start, en_start = f"pair_{identity}_ja", f"pair_{identity}_en"
+            speaker = f"↳ {unit.speaker or ''}\n" if unit.break_before else ""
+            ja = (
+                translation_caption(
+                    unit.ja_text if unit.translation_status == "completed" else "",
+                    unit.translation_status,
+                )
+                + "\n"
+            )
+            if identity in self._history_rendered:
+                # Leave the authoritative English (and any reading mark inside it)
+                # untouched when the pending Japanese becomes available.
+                begin_position, position = text.index(begin), text.index(ja_start)
+                reading_ja = text.compare("reading_position", ">=", ja_start) and text.compare(
+                    "reading_position", "<", en_start
+                )
+                text.delete(ja_start, en_start)
+                text.insert(position, ja, "ja")
+                text.mark_set(begin, begin_position)
+                text.mark_set(ja_start, position)
+                if reading_ja:
+                    text.mark_set("reading_position", ja_start)
+            else:
+                # One insertion; reuse the same widget for the entire session.
+                text.insert("1.0", speaker, "speaker", ja, "ja", unit.en_text + "\n", "en")
+                text.mark_set(begin, "1.0")
+                for mark, prefix in [(ja_start, speaker), (en_start, speaker + ja)]:
+                    length = text.tk.call("string", "length", prefix)
+                    text.mark_set(mark, f"1.0+{length}c")
+                for mark in (begin, ja_start, en_start):
+                    text.mark_gravity(mark, "right")
+            self._history_rendered.add(identity)
+            del self._history_pending[identity]
+        text.configure(state="disabled")
+        if at_top:
+            text.yview_moveto(0)
+        else:
+            text.yview("reading_position")
+
     def _render_history(self):
-        view = self.client.history.subtitle_view()
-        width = max(1, self.en_text.winfo_width())
+        view, changed, self._history_cursor, display_start = self.client.history.subtitle_frame(
+            self._history_cursor
+        )
+        self._update_history_pairs(view, changed, display_start)
+        width = max(1, self.live_text.winfo_width())
         key = (view, width)
         if key == self._render_key:
             return
         self._render_key = key
         self._render_count += 1
         values = [
-            (self.en_text, view.confirmed_en, self.confirmed_font, 1),
-            (self.partial_text, view.live_en_partial, self.en_font, 2),
-            (self.ja_text, view.ja_text, self.ja_font, 2),
+            (self.live_text, view.en_text, self.en_font, 2),
+            (
+                self.ja_text,
+                translation_caption(view.ja_text, view.translation_status),
+                self.ja_font,
+                2,
+            ),
         ]
-        if not view.ja_text and view.confirmed_unit_id is not None:
-            status = view.translation_status
-            message = (
-                "翻訳待ち…"
-                if status in {"pending", "translating", "retrying"}
-                else "翻訳検証エラー"
-                if status == "validation_failed"
-                else "未翻訳"
-            )
-            values[-1] = (self.ja_text, message, self.ja_font, 2)
-        for widget, text, face, lines in values:
-            layout_key = (text, width, lines)
+        for widget, value, face, lines in values:
+            layout_key = (value, width, lines)
             if self._caption_layout.get(widget) == layout_key:
                 continue
-            value = wrap_subtitle(text, face.measure, width, lines)
-            if widget.cget("text") != value:
-                widget.configure(text=value)
+            rendered = wrap_subtitle(value, face.measure, width, lines)
+            if widget.cget("text") != rendered:
+                widget.configure(text=rendered)
             self._caption_layout[widget] = layout_key
         self.speaker_var.set(("↳ " if view.speaker_changed else "") + (view.speaker or ""))
 

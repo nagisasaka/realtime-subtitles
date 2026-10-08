@@ -6,36 +6,59 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SubtitleViewState:
-    confirmed_en: str = ""
-    live_en_partial: str = ""
+    en_text: str = ""
     ja_text: str = ""
-    confirmed_unit_id: int | None = None
-    ja_unit_id: int | None = None
+    unit_id: int | None = None
+    history_latest_id: int = -1
     speaker: str | None = None
     speaker_changed: bool = False
     translation_status: str = ""
 
 
-def project_subtitles(unit, pending, partial, partial_speaker):
-    text = " ".join(s.en_text.strip() for s in pending) if pending else unit.en_text if unit else ""
+def project_subtitles(unit, pending, partial, partial_speaker, advanced_unit_id=-1):
+    """Keep a completed unit live until the next partial/final begins.
+
+    Held raw sources are shown immediately together with their continuation;
+    this only projects assembler ownership, it never assembles translation jobs.
+    """
+    selected = (
+        unit if unit and unit.unit_id > advanced_unit_id and not pending and not partial else None
+    )
+    text = (
+        " ".join(s.en_text.strip() for s in pending)
+        if pending
+        else selected.en_text
+        if selected
+        else ""
+    )
+    if partial:
+        text = " ".join(part for part in (text, partial) if part)
     speaker = pending[-1].speaker if pending else unit.speaker if unit else None
     changed = pending[0].break_before if pending else unit.break_before if unit else False
     known = {None, "", "UU", "SU"}
     if partial and partial_speaker not in known:
         changed = changed or (speaker not in known and speaker != partial_speaker)
         speaker = partial_speaker
-    selected = unit if unit and not pending else None
     ja = selected.ja_text or "" if selected and selected.translation_status == "completed" else ""
     return SubtitleViewState(
-        text,
-        partial,
-        ja,
-        selected.unit_id if selected else None,
-        selected.unit_id if selected and ja else None,
-        speaker if speaker not in known else None,
-        bool(changed),
-        selected.translation_status if selected else "",
+        en_text=text,
+        ja_text=ja,
+        unit_id=selected.unit_id if selected else None,
+        history_latest_id=(unit.unit_id - bool(selected)) if unit else -1,
+        speaker=speaker if speaker not in known else None,
+        speaker_changed=bool(changed),
+        translation_status=selected.translation_status if selected else "",
     )
+
+
+def translation_caption(text, status):
+    if text:
+        return text
+    if not status:
+        return ""
+    if status in {"pending", "translating", "retrying"}:
+        return "翻訳待ち…"
+    return "翻訳検証エラー" if status == "validation_failed" else "未翻訳"
 
 
 def wrap_subtitle(text, measure, width, max_lines=2):
