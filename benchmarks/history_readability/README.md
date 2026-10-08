@@ -116,3 +116,23 @@ local replay時に変化する `raw_sources.received_at` だけを比較から�
 採点の提示順確認は `compare_saved --ids 4474955-r5 4474955-r13 --reverse` を別outputへ保存する。
 
 [今回の英文先行分割方式の評価](../../docs/history-two-stage-evaluation.md)：構造成功率は向上したが、分断の悪化例が再現。プロンプト変更なし。
+
+## 文法依存を保つ分割プロンプトの評価
+
+[追加の改善評価](../../docs/history-dependency-prompt-evaluation.md) では、直前の2段階版を比較対象に英文分割側だけを変更した。
+`dependency_prompt_20261008/manifest.json` は `two_stage_20261008/manifest.json` の同一コピー、
+`before/{dev,holdout}.json` は同directoryの `current` 出力のコピーである。
+候補は明示的な `--prompt` で指定し、baselineの入力や識別hashは付け替えていない。
+
+```bash
+.venv/bin/python -m benchmarks.history_readability.run \
+  --output benchmark_results/history_readability/dependency_prompt_20261008 \
+  --name candidate3 \
+  --prompt benchmark_results/history_readability/dependency_prompt_20261008/candidate3.txt \
+  --compare benchmark_results/history_readability/dependency_prompt_20261008/before/dev.json
+```
+
+同じコマンドはcacheを使う。追加実測の `--nonce` は同じledgerの残予算を消費する。
+既知4窓は未見holdoutではない。調整後の未使用2窓は別の `fresh_manifest.json` に固定し、
+同じ `Runner` / ledgerで両promptを評価した。追加request上限を別directoryで回避していない。
+全候補と棄却理由・採点の矛盾も保存し、最良出力だけを残す扱いはしていない。

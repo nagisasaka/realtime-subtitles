@@ -36,6 +36,9 @@ Speechmatics Translationは設定・使用しません。OpenAI Realtime Transla
 3. 全ペアの検証が成功した場合だけ、履歴をまとめて差し替えます。
 
 元のfinalやTranslationUnitの途中にも境界を置けます。語数や句読点による強制分割はしません。
+分割プロンプトではASRの句読点・大文字始まりを弱い手掛かりとし、主語と述語、動詞と目的語、
+修飾句と修飾先を同じまとまりに保つよう指示します。独立した話題は分け、欠けた続きを生成しません。
+これはLLMへの指示であり、文法的な分割品質を保証するハードルールではありません。
 [Responsesの構造化出力](https://developers.openai.com/api/docs/guides/structured-outputs)
 を使用し、英文tokenの完全被覆、IDの欠落・重複・範囲外、日本語の空欄を検査します。
 数値・通貨・単位等は**チャンクごと**に既存Validatorで検査します。
@@ -59,6 +62,7 @@ JSONLへ `history_revision` として、固定した `chunks`、段階別 `decis
 同じ既知話者の範囲だけを対象に、話者／session／Clearの境界を越えません。
 Diagnosticsの `history_reconstruction` で件数・queue・失敗状態を確認できます。
 新方式の実測・テスト結果は [実装レポート](docs/history-split-first-implementation.md) に記載しています。
+分割プロンプト改善後のEarnings22試験は [改善評価](docs/history-dependency-prompt-evaluation.md) に記載しています。
 旧方式の評価結果は [過去の評価記録](docs/history-readability-results.md) に残しています。
 
 ## Gitの復元ポイント
