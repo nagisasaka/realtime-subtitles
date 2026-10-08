@@ -93,9 +93,7 @@ def pairs(manifest, run, baseline):
             ]
         )
         for label, result in [("A", a), ("B", b)]:
-            lines.extend(
-                [f"### {label}", "", "全文訳: " + result.get("japanese_translation", "未取得"), ""]
-            )
+            lines.extend([f"### {label}", ""])
             for p in result.get("paragraphs", []):
                 lines.extend([p["ja"], "", p["en"], "", "---", ""])
     return "\n".join(lines)

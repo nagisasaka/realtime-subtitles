@@ -10,10 +10,16 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
-from realtime_subtitles.history_reconstruction import ReconstructionDecision, align_paragraphs
+from realtime_subtitles.history_reconstruction import (
+    BATCH_TRANSLATION_INSTRUCTIONS,
+    BatchTranslation,
+    EnglishSplit,
+    pair_translations,
+    split_english,
+    validate_paragraphs,
+)
 from realtime_subtitles.text_translation import safe_error
 from realtime_subtitles.translation_validation import (
-    TranslationValidator,
     retry_instructions,
     serious,
 )
@@ -116,7 +122,9 @@ class Runner:
             write_json(path, result)
             return result
 
-    async def translate(self, window, prompt, *, nonce=""):
+    async def translate(
+        self, window, prompt, *, nonce="", translation_prompt=BATCH_TRANSLATION_INSTRUCTIONS
+    ):
         data = {
             "CONTEXT": window["context"],
             "FULL_ENGLISH": window["english"],
@@ -124,48 +132,44 @@ class Runner:
                 {"index": i, "text": t} for i, t in enumerate(window["english"].split())
             ],
         }
-        attempts, instruction = [], ""
+        attempts = []
         result = {"id": window["id"], "input_hash": digest(data), "attempts": attempts}
+        call = await self.call(window["id"] + "-split", prompt, data, EnglishSplit, nonce=nonce)
+        attempts.append(dict(call, stage="split"))
+        result["status"] = call["status"]
+        if call["status"] != "completed" or not call.get("parsed"):
+            return result
+        try:
+            chunks = split_english(window["english"], EnglishSplit.model_validate(call["parsed"]))
+        except ValueError as exc:
+            return dict(result, status="structural_failure", structural_error=type(exc).__name__)
+        result["chunks"] = [asdict(c) for c in chunks]
+        targets = {
+            "CONTEXT": window["context"],
+            "TARGETS": [
+                {"id": c.id, "text": window["english"][c.en_start : c.en_end]} for c in chunks
+            ],
+        }
+        instruction = ""
         for attempt in range(2):
             call = await self.call(
-                window["id"], prompt + instruction, data, ReconstructionDecision, nonce=nonce
+                window["id"] + "-translate",
+                translation_prompt + instruction,
+                targets,
+                BatchTranslation,
+                nonce=nonce,
             )
-            attempts.append(call)
-            result["status"] = call["status"]
+            attempts.append(dict(call, stage="translate"))
+            result.update(status=call["status"], retry_count=attempt)
             if call["status"] != "completed" or not call.get("parsed"):
                 return result
-            decision = ReconstructionDecision.model_validate(call["parsed"])
-            result["japanese_translation"] = decision.japanese_translation
             try:
-                aligned = align_paragraphs(window["english"], decision)
+                aligned = pair_translations(chunks, BatchTranslation.model_validate(call["parsed"]))
             except ValueError as exc:
-                result["status"] = "structural_failure"
-                result["structural_error"] = str(exc)
-                # Diagnostic draft only, never accepted by the production renderer.
-                diagnostic = decision.model_copy(
-                    update={
-                        "japanese_translation": "".join(
-                            p.japanese_text for p in decision.paragraphs
-                        )
-                    }
+                return dict(
+                    result, status="structural_failure", structural_error=type(exc).__name__
                 )
-                try:
-                    aligned = align_paragraphs(window["english"], diagnostic)
-                    result["paragraphs"] = [
-                        {
-                            "en": window["english"][p.en_start : p.en_end],
-                            "ja": p.ja_text,
-                            "en_start": p.en_start,
-                            "en_end": p.en_end,
-                        }
-                        for p in aligned
-                    ]
-                except ValueError:
-                    pass
-                return result
-            issues = TranslationValidator().validate(
-                window["english"], decision.japanese_translation, context=window["context"]
-            )
+            issues = validate_paragraphs(window["english"], aligned, window["context"])
             result.update(
                 paragraphs=[
                     {
@@ -176,9 +180,7 @@ class Runner:
                     }
                     for p in aligned
                 ],
-                japanese_translation=decision.japanese_translation,
                 issues=[asdict(i) for i in issues],
-                retry_count=attempt,
             )
             if not serious(issues):
                 result["status"] = "valid"

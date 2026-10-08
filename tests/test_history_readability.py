@@ -7,7 +7,7 @@ import pytest
 from benchmarks.history_readability.judge import Verdict, check_verdict
 from benchmarks.history_readability.prepare import digest, replay, select
 from benchmarks.history_readability.runner import Budget, Runner
-from realtime_subtitles.history_reconstruction import ReconstructionDecision, align_paragraphs
+from realtime_subtitles.history_reconstruction import BatchTranslation, EnglishSplit
 
 
 def event(text, i, *, kind="AddSegment", speaker="S1"):
@@ -73,19 +73,16 @@ def test_budget_persistent_and_reserved_before_failure(tmp_path):
         Budget(path, 1).reserve("another")
 
 
-def decision():
-    return ReconstructionDecision(
-        japanese_translation="はい。",
-        paragraphs=[{"english_end_token": 0, "japanese_text": "はい。"}],
-    )
-
-
 def fake_client(calls, error=False):
     async def parse(**kwargs):
         calls.append(kwargs)
         if error:
             raise ConnectionError("sensitive detail must not be logged")
-        d = decision()
+        d = (
+            BatchTranslation(translations=[{"id": 0, "ja": "はい。"}])
+            if kwargs["text_format"] is BatchTranslation
+            else EnglishSplit(end_tokens=[0])
+        )
         return SimpleNamespace(
             status="completed",
             output_parsed=d,
@@ -100,13 +97,13 @@ def test_cache_keys_cover_prompt_context_schema_and_regeneration(tmp_path):
     async def run():
         calls = []
         r = Runner(tmp_path, fake_client(calls))
-        await r.call("w", "p", {"c": "a"}, ReconstructionDecision)
-        await r.call("w", "p", {"c": "a"}, ReconstructionDecision)
+        await r.call("w", "p", {"c": "a"}, EnglishSplit)
+        await r.call("w", "p", {"c": "a"}, EnglishSplit)
         assert len(calls) == 1
-        await r.call("w", "p2", {"c": "a"}, ReconstructionDecision)
-        await r.call("w", "p", {"c": "b"}, ReconstructionDecision)
+        await r.call("w", "p2", {"c": "a"}, EnglishSplit)
+        await r.call("w", "p", {"c": "b"}, EnglishSplit)
         await r.call("w", "p", {"c": "a"}, Verdict)
-        await r.call("w", "p", {"c": "a"}, ReconstructionDecision, nonce="repeat")
+        await r.call("w", "p", {"c": "a"}, EnglishSplit, nonce="repeat")
         assert len(calls) == 5
         assert calls[0]["max_output_tokens"] == 5000
 
@@ -117,30 +114,15 @@ def test_deadline_no_new_api_and_failure_saved(tmp_path):
     async def run():
         now, calls = [10], []
         r = Runner(tmp_path, fake_client(calls, error=True), seconds=1, clock=lambda: now[0])
-        failed = await r.call("w", "p", {}, ReconstructionDecision)
+        failed = await r.call("w", "p", {}, EnglishSplit)
         assert failed["error"] == "ConnectionError"
         assert "sensitive" not in str(failed)
         assert len(list((tmp_path / "cache").glob("*.json"))) == 1
         now[0] = 12
-        timed = await r.call("w", "different", {}, ReconstructionDecision)
+        timed = await r.call("w", "different", {}, EnglishSplit)
         assert timed["status"] == "deadline" and len(calls) == 1
 
     asyncio.run(run())
-
-
-def test_source_preserved_and_partition_rejected():
-    english = "What we really need to think about is reliability in production."
-    d = ReconstructionDecision(
-        japanese_translation="本番の信頼性。",
-        paragraphs=[{"english_end_token": 11, "japanese_text": "本番の信頼性。"}],
-    )
-    with pytest.raises(ValueError):
-        align_paragraphs(english, d)
-    d.paragraphs[0].english_end_token = len(english.split()) - 1
-    assert english[align_paragraphs(english, d)[0].en_start :] == english
-    d.paragraphs[0].japanese_text = "別の訳"
-    with pytest.raises(ValueError, match="Japanese"):
-        align_paragraphs(english, d)
 
 
 def test_judge_coverage_is_not_silently_counted_as_zero():
@@ -172,7 +154,7 @@ def test_wall_timeout_and_concurrency_cap(tmp_path):
 
         r = Runner(tmp_path, SimpleNamespace(responses=SimpleNamespace(parse=parse)), seconds=0.03)
         outputs = await asyncio.gather(
-            *(r.call(str(i), str(i), {}, ReconstructionDecision) for i in range(4))
+            *(r.call(str(i), str(i), {}, EnglishSplit) for i in range(4))
         )
         assert maximum == 2 and active == 0
         assert len(r.budget.data["attempts"]) == 2
@@ -188,9 +170,10 @@ def test_validator_retries_once_without_changing_source(tmp_path):
 
         async def parse(**kwargs):
             requests.append(kwargs)
-            d = ReconstructionDecision(
-                japanese_translation="200万トークンです。",
-                paragraphs=[{"english_end_token": 1, "japanese_text": "200万トークンです。"}],
+            d = (
+                EnglishSplit(end_tokens=[1])
+                if kwargs["text_format"] is EnglishSplit
+                else BatchTranslation(translations=[{"id": 0, "ja": "200万トークンです。"}])
             )
             return SimpleNamespace(
                 status="completed",
@@ -204,9 +187,9 @@ def test_validator_retries_once_without_changing_source(tmp_path):
         original = deepcopy(w)
         result = await r.translate(w, "Translate only source")
         assert result["status"] == "validation_failed" and result["retry_count"] == 1
-        assert len(requests) == 2
-        assert requests[0]["input"] == requests[1]["input"] and w == original
-        assert requests[0]["instructions"] != requests[1]["instructions"]
+        assert len(requests) == 3
+        assert requests[1]["input"] == requests[2]["input"] and w == original
+        assert requests[1]["instructions"] != requests[2]["instructions"]
 
     asyncio.run(run())
 
@@ -252,7 +235,9 @@ def test_resume_retains_invocation_and_cached_calls(tmp_path):
     write_json(
         tmp_path / "manifest.json",
         {
+            "pipeline": "split_then_batch_translate_v1",
             "baseline_prompt": "test",
+            "translation_prompt": "translate",
             "windows": [{"id": "w", "split": "dev", "english": "Yes.", "context": []}],
         },
     )
@@ -274,11 +259,11 @@ def test_resume_retains_invocation_and_cached_calls(tmp_path):
         assert read_json(first)["status"] == "finished"
         second = await execute(args, fake_client(calls))
         assert len(read_json(second)["previous_invocations"]) == 1
-        assert len(calls) == 1
+        assert len(calls) == 2
         args.seconds = -1
         args.name = "deadline"
         args.nonce = "new"
         result = read_json(await execute(args, fake_client(calls)))
-        assert result["status"] == "incomplete" and len(calls) == 1
+        assert result["status"] == "incomplete" and len(calls) == 2
 
     asyncio.run(run())

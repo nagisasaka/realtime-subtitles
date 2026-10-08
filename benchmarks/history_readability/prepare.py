@@ -7,7 +7,10 @@ import subprocess
 from dataclasses import asdict
 from pathlib import Path
 
-from realtime_subtitles.history_reconstruction import RECONSTRUCTION_INSTRUCTIONS
+from realtime_subtitles.history_reconstruction import (
+    BATCH_TRANSLATION_INSTRUCTIONS,
+    SPLIT_INSTRUCTIONS,
+)
 from realtime_subtitles.translation_assembler import TranslationUnitAssembler
 from realtime_subtitles.translation_history import TranslationHistory
 
@@ -151,7 +154,9 @@ def main():
             for name in ("manifest.json", "events.jsonl", "transcript.jsonl")
         },
         "source_manifest": read_json(args.source / "manifest.json"),
-        "baseline_prompt": RECONSTRUCTION_INSTRUCTIONS,
+        "pipeline": "split_then_batch_translate_v1",
+        "baseline_prompt": SPLIT_INSTRUCTIONS,
+        "translation_prompt": BATCH_TRANSLATION_INSTRUCTIONS,
         "model": "gpt-6-luna",
         "reasoning": {"effort": "none"},
         "windows": selected,

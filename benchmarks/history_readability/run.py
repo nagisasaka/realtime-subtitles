@@ -18,6 +18,10 @@ def utc():
 
 async def execute(args, api):
     manifest = read_json(args.output / "manifest.json")
+    if manifest.get("pipeline") != "split_then_batch_translate_v1":
+        raise ValueError(
+            "Prepare a new manifest for split-then-translate; old results are historical"
+        )
     windows = [w for w in manifest["windows"] if w["split"] == args.split]
     if args.ids:
         windows = [w for w in windows if w["id"] in args.ids]
@@ -65,7 +69,9 @@ async def execute(args, api):
 
     async def translate(w):
         try:
-            result = await runner.translate(w, prompt, nonce=args.nonce)
+            result = await runner.translate(
+                w, prompt, nonce=args.nonce, translation_prompt=manifest["translation_prompt"]
+            )
         except Exception as exc:
             result = {"id": w["id"], "status": "error", "error": type(exc).__name__, "attempts": []}
         report["results"][w["id"]] = result
@@ -76,7 +82,6 @@ async def execute(args, api):
         paragraphs = [dict(p, paragraph=i) for i, p in enumerate(result["paragraphs"])]
         return {
             "paragraphs": paragraphs,
-            "full_translation": result["japanese_translation"],
             "INTERNAL_BOUNDARIES": [
                 {"after_paragraph": i, "left": paragraphs[i], "right": paragraphs[i + 1]}
                 for i in range(len(paragraphs) - 1)

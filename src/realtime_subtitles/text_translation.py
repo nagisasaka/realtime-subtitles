@@ -145,6 +145,14 @@ class TranslationWorker:
                     break
                 self.history.update_translation(segment.sequence_id, "cancelled", error=self.error)
 
+    def _validate(self, segment, text, context):
+        return self.validator.validate(
+            segment.en_text,
+            text,
+            context=context,
+            previous_translations=self.history.previous_translations(segment.sequence_id),
+        )
+
     async def _one(self, translator, segment, context):
         self.history.update_translation(segment.sequence_id, "translating")
         started_ms = round(self.clock() * 1000)
@@ -232,14 +240,7 @@ class TranslationWorker:
                 candidates.append(candidate)
                 validation_start = self.clock()
                 try:
-                    issues = self.validator.validate(
-                        segment.en_text,
-                        text,
-                        context=context,
-                        previous_translations=self.history.previous_translations(
-                            segment.sequence_id
-                        ),
-                    )
+                    issues = self._validate(segment, text, context)
                     if incomplete:
                         issues.append(
                             ValidationIssue("invalid_output", "error", "Response incomplete.")

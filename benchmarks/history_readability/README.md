@@ -1,6 +1,8 @@
 # 履歴再翻訳の小規模評価
 
 保存済みAgent STTイベントを本番のfinal結合・再構成window plannerへ通し、同じ英文/contextで再翻訳promptを比較する。マイクとSpeechmaticsは起動しない。
+現在は本番と同じ英文分割→ID付き一括翻訳の2段階。`--prompt` は英文分割側だけを変更し、翻訳プロンプトはmanifestに固定する。
+旧 `run1` は旧方式の評価記録のため再利用せず、新しいmanifestを準備する（旧形式はrunnerが拒否する）。
 作業条件・採用基準は [goal仕様](../../docs/history-readability-goal.md) に固定する。
 
 ## 準備
@@ -11,7 +13,7 @@ Earnings22の取得済み結果directoryを指定する。取得元worktreeへ�
 ```bash
 .venv/bin/python -m benchmarks.history_readability.prepare \
   --source /workspace/jimaku-earnings-benchmark/benchmark_results/earnings22/20261008_arqit_completed \
-  --output benchmark_results/history_readability/run1
+  --output benchmark_results/history_readability/two-stage
 ```
 
 最初はwindow一覧のみ表示。選定はモデル出力を見る前に固定する。
@@ -28,15 +30,15 @@ queue failureや再翻訳到着時間による実画面状態まではこのplan
 
 ```bash
 .venv/bin/python -m benchmarks.history_readability.run \
-  --output benchmark_results/history_readability/run1 --name baseline
+  --output benchmark_results/history_readability/two-stage --name baseline
 .venv/bin/python -m benchmarks.history_readability.run \
-  --output benchmark_results/history_readability/run1 --name candidate1 \
-  --prompt benchmark_results/history_readability/run1/candidate1.txt \
-  --compare benchmark_results/history_readability/run1/baseline/dev.json
+  --output benchmark_results/history_readability/two-stage --name candidate1 \
+  --prompt benchmark_results/history_readability/two-stage/candidate1.txt \
+  --compare benchmark_results/history_readability/two-stage/baseline/dev.json
 .venv/bin/python -m benchmarks.history_readability.report \
-  benchmark_results/history_readability/run1/candidate1/dev.json \
-  --baseline benchmark_results/history_readability/run1/baseline/dev.json \
-  --manifest benchmark_results/history_readability/run1/manifest.json
+  benchmark_results/history_readability/two-stage/candidate1/dev.json \
+  --baseline benchmark_results/history_readability/two-stage/baseline/dev.json \
+  --manifest benchmark_results/history_readability/two-stage/manifest.json
 ```
 
 - `--split holdout`: 採用候補確定後だけ使用。
@@ -45,7 +47,7 @@ queue failureや再翻訳到着時間による実画面状態まではこのplan
 - `--reverse`: judgeのA/B表示順を反転する。
 - `--seconds 240`: API作業deadline。上限480秒、各request45秒、同時2件まで。
 - 既定の80 attempt上限は同じoutputの `ledger.json` で永続管理。別outputへ移して上限を回避しない。
-- SDK retryなし。重大なローカル翻訳検証エラーだけ最大1回retry。schema失敗・通信失敗は保存して終了。
+- 通常は2 request/範囲。SDK retryなし。重大なローカル翻訳検証エラーだけ、固定境界で一括翻訳を最大1回retry。schema失敗・通信失敗は保存して終了。
 - request前に予算予約、各結果受信直後にatomic保存。prompt/input/schema/model/nonceのhashでcacheする。
 - 再開は同じコマンド。cache済みAPI成功・失敗は再送しない。deadlineで未送信のものだけ続行する。
 - 排他lockは異常終了時に残る。記載PIDが生きていないことを確認してから除去する。
@@ -57,8 +59,8 @@ queue failureや再翻訳到着時間による実画面状態まではこのplan
 厳密な被覆検証・翻訳Validatorと、別requestの固定LLM採点を併用する。
 同じLunaによる採点には自己評価・順序・表現の好みの偏りがある。Codexのレビューも人間評価ではない。
 
-構造検証に失敗した出力は本番に適用されない。ただし英文範囲を復元できる場合は、
-**棄却draftの診断**として英日部分を保存し、再分割の問題を比較する。これを実画面改善と混同しない。
+構造検証に失敗した出力は本番に適用されない。正常にID対応できた検証棄却訳だけをdraftとして記録し、実画面改善と混同しない。
+旧方式の全文訳と部分訳の連結一致を修復してdraftを生成する処理は削除した。
 自動指標の段落数は棄却draftを含むため、必ずvalid/structural_failure件数と一緒に読む。
 採点が全境界を覆わない場合は `judge_invalid`。欠測を0件の誤りとして扱わない。
 ASR-only入力のため以前のJAは存在せず、既存validatorのprevious_translationsは全案で空。
@@ -79,10 +81,10 @@ source manifestに記録された版・取得元・ライセンスを維持し�
 
 ```powershell
 python -m benchmarks.history_readability.preview `
-  --manifest benchmark_results/history_readability/run1/manifest.json `
-  --a benchmark_results/history_readability/run1/baseline/dev.json `
-  --b benchmark_results/history_readability/run1/candidate3/dev.json `
-  --output benchmark_results/history_readability/run1/windows-preview.json
+  --manifest benchmark_results/history_readability/two-stage/manifest.json `
+  --a benchmark_results/history_readability/two-stage/baseline/dev.json `
+  --b benchmark_results/history_readability/two-stage/candidate3/dev.json `
+  --output benchmark_results/history_readability/two-stage/windows-preview.json
 ```
 
 同じ幅・DPI・フォントのText widgetで各例を8秒ずつ表示し、実Tkのdisplaylinesを保存する。

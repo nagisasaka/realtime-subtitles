@@ -6,11 +6,13 @@ import pytest
 from conftest import make_unit
 
 from realtime_subtitles.history_reconstruction import (
-    ParagraphDecision,
+    BatchTranslation,
+    EnglishSplit,
     ReconstructedParagraph,
-    ReconstructionDecision,
     ReconstructionTranslator,
-    align_paragraphs,
+    ReconstructionWorker,
+    pair_translations,
+    split_english,
 )
 from realtime_subtitles.text_translation import TranslationWorker
 from realtime_subtitles.translation_history import TranslationHistory
@@ -139,102 +141,214 @@ def test_reconstruction_queue_bounded_and_independent():
     assert h.subtitle_view().en_text == "Live English keeps going"
 
 
-@pytest.mark.parametrize("invalid", [False, True])
-def test_model_translates_full_passage_then_partitions_inside_original_unit(invalid):
+async def reconstruct(h, target, outputs, context=None, observer=None):
     from types import SimpleNamespace
 
+    translator = ReconstructionTranslator("offline", h.reconstructions)
+    await translator.client.close()
+    calls = []
+
+    async def parse(**kwargs):
+        calls.append(kwargs)
+        if observer:
+            observer(len(calls))
+        value = outputs[len(calls) - 1]
+        if isinstance(value, BaseException):
+            raise value
+        if isinstance(value, SimpleNamespace):
+            return value
+        return SimpleNamespace(
+            status="completed",
+            usage=None,
+            output_parsed=kwargs["text_format"].model_validate(value),
+        )
+
+    translator.client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
+    await ReconstructionWorker(h.reconstructions, "offline")._one(translator, target, context or [])
+    return calls
+
+
+def batch(*texts):
+    return {"translations": [{"id": i, "ja": text} for i, text in enumerate(texts)]}
+
+
+def test_split_before_translation_and_ids_restore_order_without_rewriting_source():
     h = TranslationHistory()
     add(h, "The landscape is")
     h.update_translation(0, "completed", text="状況は……")
     target = h.reconstructions.plan(add(h, "changing. Reliability matters."))
-    requests = []
+    original = [asdict(u) for u in h.segments()]
+    context = [{"speaker": "S1", "text": "An earlier thought."}]
+    translation = batch("状況は変化しています。", "信頼性が重要です。")
+    translation["translations"].reverse()
 
-    async def run():
-        translator = ReconstructionTranslator("offline", h.reconstructions)
-        await translator.client.close()
+    def observer(call):
+        revision = h.reconstructions.entries()[0]
+        assert revision.translation.translation_status != "completed"
+        assert len(h.reconstructions.effective_units()) == 2
+        if call == 2:
+            assert len(revision.chunks) == 2  # Fixed before any Japanese is requested.
+            assert not revision.paragraphs
 
-        async def parse(**kwargs):
-            requests.append(kwargs)
-            return SimpleNamespace(
-                status="completed",
-                usage=None,
-                output_parsed=ReconstructionDecision(
-                    japanese_translation="状況は変化しています。信頼性が重要です。",
-                    paragraphs=[
-                        ParagraphDecision(
-                            english_end_token=3, japanese_text="状況は変化しています。"
-                        ),
-                        ParagraphDecision(
-                            english_end_token=4 if invalid else 5,
-                            japanese_text="信頼性が重要です。",
-                        ),
-                    ],
-                ),
-            )
-
-        translator.client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
-        await TranslationWorker(h.reconstructions, "offline")._one(translator, target, [])
-
-    asyncio.run(run())
-    request = requests[0]
-    assert request["text_format"] is ReconstructionDecision
-    assert request["reasoning"] == {"effort": "none"} and request["model"] == "gpt-6-luna"
-    assert "First" in request["instructions"] and "ENTIRE passage" in request["instructions"]
-    data = json.loads(request["input"])
-    assert data["FULL_ENGLISH"] == target.en_text
-    assert "REVIEW_UNITS" not in data  # Arbitrary streaming cuts do not bias the model.
-    assert data["ENGLISH_TOKENS"][3] == {"index": 3, "text": "changing."}
-    revision = h.reconstructions.entries()[0]
-    assert revision.translation.translation_status == ("failed" if invalid else "completed")
-    assert revision.decisions[0]["decision"]["japanese_translation"].startswith("状況")
-    assert h.segments()[0].ja_text == "状況は……"
-    assert len(requests) == 1
-    if not invalid:
-        assert [target.en_text[p.en_start : p.en_end] for p in revision.paragraphs] == [
-            "The landscape is changing.",
-            "Reliability matters.",
-        ]
-        saved = h.saved_text()
-        assert "EN: The landscape is changing.\nJA: 状況は変化しています。" in saved
-        assert "EN: Reliability matters.\nJA: 信頼性が重要です。" in saved
-
-
-@pytest.mark.parametrize(
-    "ends,parts,full",
-    [
-        ([0], ["一。"], "一。"),  # Missing English tokens.
-        ([0, 0, 2], ["一。", "二。", "三。"], "一。二。三。"),  # Duplicate English.
-        ([3], ["一。"], "一。"),  # Out-of-range.
-        ([2], [""], "一。"),
-        ([2], ["一。"], "一。二。"),  # Missing Japanese.
-        ([0, 2], ["一。", "一。"], "一。"),  # Duplicate Japanese.
-        ([], [], ""),
-    ],
-)
-def test_reject_invalid_partition_without_semantic_rules(ends, parts, full):
-    result = ReconstructionDecision(
-        japanese_translation=full,
-        paragraphs=[
-            ParagraphDecision(english_end_token=i, japanese_text=part)
-            for i, part in zip(ends, parts, strict=True)
-        ],
+    calls = asyncio.run(
+        reconstruct(
+            h,
+            target,
+            [
+                {"end_tokens": [3, 5]},
+                translation,
+            ],
+            context,
+            observer,
+        )
     )
+    assert len(calls) == 2
+    assert calls[0]["text_format"] is EnglishSplit
+    assert calls[1]["text_format"] is BatchTranslation
+    for call in calls:
+        assert call["reasoning"] == {"effort": "none"} and call["model"] == "gpt-6-luna"
+        assert call["store"] is False
+        assert json.loads(call["input"])["CONTEXT"] == context
+    data = json.loads(calls[0]["input"])
+    assert data["FULL_ENGLISH"] == target.en_text
+    assert "REVIEW_UNITS" not in data
+    assert data["ENGLISH_TOKENS"][3] == {"index": 3, "text": "changing."}
+    assert json.loads(calls[1]["input"])["TARGETS"] == [
+        {"id": 0, "text": "The landscape is changing."},
+        {"id": 1, "text": "Reliability matters."},
+    ]
+    revision = h.reconstructions.entries()[0]
+    assert revision.translation.translation_status == "completed"
+    assert [d["stage"] for d in revision.decisions] == ["split", "translate"]
+    assert [asdict(u) for u in h.segments()] == original
+    saved = h.saved_text()
+    assert "EN: The landscape is changing.\nJA: 状況は変化しています。" in saved
+    assert "EN: Reliability matters.\nJA: 信頼性が重要です。" in saved
+
+
+@pytest.mark.parametrize("ends", [[0], [0, 0, 2], [3], [-1, 2], [], [2, 1]])
+def test_reject_invalid_english_coverage(ends):
     with pytest.raises(ValueError):
-        align_paragraphs("Three original tokens.", result)
+        split_english("Three original tokens.", EnglishSplit(end_tokens=ends))
+
+
+@pytest.mark.parametrize("ids", [[0], [0, 0], [0, 2], [0, 1, 2], []])
+def test_reject_invalid_translation_ids(ids):
+    chunks = split_english("First. Second.", EnglishSplit(end_tokens=[0, 1]))
+    with pytest.raises(ValueError):
+        pair_translations(
+            chunks, BatchTranslation(translations=[{"id": i, "ja": "訳"} for i in ids])
+        )
+
+
+@pytest.mark.parametrize("field", ["index", "id"])
+def test_indexes_cannot_be_coerced_from_bool_or_string(field):
+    for value in [True, "0", 0.5]:
+        with pytest.raises(ValueError):
+            if field == "index":
+                EnglishSplit(end_tokens=[value])
+            else:
+                BatchTranslation(translations=[{"id": value, "ja": "訳"}])
+
+
+def test_empty_japanese_rejected():
+    chunks = split_english("Yes.", EnglishSplit(end_tokens=[0]))
+    with pytest.raises(ValueError):
+        pair_translations(chunks, BatchTranslation.model_validate(batch(" \n ")))
 
 
 def test_unicode_whitespace_and_punctuation_preserved():
     en = "  OpenAI’s 🚀  reliability in production.\nReally?  "
-    decision = ReconstructionDecision(
-        japanese_translation="本番での信頼性。\n本当？",
-        paragraphs=[
-            ParagraphDecision(english_end_token=4, japanese_text="本番での信頼性。"),
-            ParagraphDecision(english_end_token=5, japanese_text="本当？"),
-        ],
+    chunks = split_english(en, EnglishSplit(end_tokens=[4, 5]))
+    parts = pair_translations(
+        chunks, BatchTranslation.model_validate(batch("本番での信頼性。", "本当？"))
     )
-    parts = align_paragraphs(en, decision)
     assert en[parts[0].en_start : parts[0].en_end] == "OpenAI’s 🚀  reliability in production."
     assert en[parts[1].en_start : parts[1].en_end] == "Really?"
+
+
+@pytest.mark.parametrize("valid_retry", [True, False])
+def test_retry_translates_only_frozen_chunks_and_preserves_candidates(valid_retry):
+    h = TranslationHistory()
+    add(h, "The price is")
+    target = h.reconstructions.plan(add(h, "$2 million."))
+    outputs = [
+        {"end_tokens": [4]},
+        batch("200万トークンです。"),
+        batch("価格は200万ドルです。" if valid_retry else "200万トークンです。"),
+    ]
+    calls = asyncio.run(reconstruct(h, target, outputs))
+    assert len(calls) == 3
+    assert calls[1]["input"] == calls[2]["input"]
+    assert calls[1]["instructions"] != calls[2]["instructions"]
+    revision = h.reconstructions.entries()[0]
+    assert [d["stage"] for d in revision.decisions] == ["split", "translate", "translate"]
+    assert revision.translation.retry_count == 1
+    assert len(revision.translation.candidates) == 2
+    assert revision.translation.translation_status == (
+        "completed" if valid_retry else "validation_failed"
+    )
+    if not valid_retry:
+        assert len(h.reconstructions.effective_units()) == 2
+    assert h.segments()[1].en_text == "$2 million."
+    with pytest.raises(ValueError, match="fixed"):
+        h.reconstructions.set_chunks(
+            0, split_english(target.en_text, EnglishSplit(end_tokens=[0, 4]))
+        )
+
+
+def test_chunk_validation_detects_currency_swapped_between_chunks():
+    h = TranslationHistory()
+    add(h, "$2 million.")
+    target = h.reconstructions.plan(add(h, "2 million tokens."))
+    bad = batch("200万トークン。", "200万ドル。")
+    calls = asyncio.run(reconstruct(h, target, [{"end_tokens": [1, 4]}, bad, bad]))
+    assert len(calls) == 3  # Whole-passage quantities would incorrectly balance out.
+    revision = h.reconstructions.entries()[0]
+    assert revision.translation.translation_status == "validation_failed"
+    assert any(i["message"].startswith("Chunk 0:") for i in revision.translation.validation_issues)
+
+
+@pytest.mark.parametrize(
+    "outputs,expected_calls",
+    [
+        ([{"end_tokens": [0]}], 1),  # Invalid split must never be translated.
+        ([{"end_tokens": [1]}, batch()], 2),  # Missing id: preserve old display.
+        ([{"end_tokens": [1]}, ValueError("sensitive")], 2),
+    ],
+)
+def test_structural_failure_retains_originals(outputs, expected_calls):
+    h = TranslationHistory()
+    add(h, "Still")
+    target = h.reconstructions.plan(add(h, "live."))
+    calls = asyncio.run(reconstruct(h, target, outputs))
+    assert len(calls) == expected_calls
+    revision = h.reconstructions.entries()[0]
+    assert revision.translation.translation_status == "failed"
+    assert "sensitive" not in revision.translation.translation_error
+    assert len(h.reconstructions.effective_units()) == 2
+    h.set_partial("Latest partial")
+    assert h.subtitle_view().en_text == "Latest partial"
+
+
+def test_transport_retry_after_split_never_resplits():
+    h = TranslationHistory()
+    add(h, "Still")
+    target = h.reconstructions.plan(add(h, "live."))
+    calls = asyncio.run(
+        reconstruct(
+            h, target, [{"end_tokens": [1]}, ConnectionError("secret"), batch("まだ続いています。")]
+        )
+    )
+    assert len(calls) == 3 and calls[1]["input"] == calls[2]["input"]
+    assert h.reconstructions.entries()[0].translation.translation_status == "completed"
+
+
+def test_source_in_production_not_changed_to_and_production():
+    en = "What we really need to think about is reliability in production."
+    chunks = split_english(en, EnglishSplit(end_tokens=[len(en.split()) - 1]))
+    parts = pair_translations(chunks, BatchTranslation.model_validate(batch("本番環境の信頼性。")))
+    assert en[parts[0].en_start : parts[0].en_end] == en
 
 
 def test_reconstruction_failure_does_not_block_original_translation_or_partial():
@@ -276,16 +390,13 @@ def test_autosave_preserves_originals_and_partitioned_revision(tmp_path):
     h = TranslationHistory()
     add(h, "The landscape is")
     target = h.reconstructions.plan(add(h, "changing. Reliability matters."))
-    decision = ReconstructionDecision(
-        japanese_translation="状況は変わっています。信頼性が重要です。",
-        paragraphs=[
-            ParagraphDecision(english_end_token=3, japanese_text="状況は変わっています。"),
-            ParagraphDecision(english_end_token=5, japanese_text="信頼性が重要です。"),
-        ],
+    asyncio.run(
+        reconstruct(
+            h,
+            target,
+            [{"end_tokens": [3, 5]}, batch("状況は変わっています。", "信頼性が重要です。")],
+        )
     )
-    h.reconstructions.record_decision(0, decision.model_dump(), None)
-    h.reconstructions.set_paragraphs(0, align_paragraphs(target.en_text, decision))
-    h.reconstructions.update_translation(0, "completed", text=decision.japanese_translation)
     saver = TranscriptAutosave({"subtitles": h}, directory=tmp_path)
     assert saver.close(5)
     rows = [
@@ -296,6 +407,85 @@ def test_autosave_preserves_originals_and_partitioned_revision(tmp_path):
     assert len([r for r in records if r["kind"] == "raw_source_segment"]) == 2
     assert len([r for r in records if r["kind"] == "translation_unit"]) == 2
     revisions = [r for r in records if r["kind"] == "history_revision"]
+    assert len(revisions[-1]["chunks"]) == 2
+    assert [d["stage"] for d in revisions[-1]["decisions"]] == ["split", "translate"]
     assert revisions[-1]["paragraphs"][1]["ja_text"] == "信頼性が重要です。"
     saved = (saver.directory / "subtitles.txt").read_text(encoding="utf-8")
     assert "EN: The landscape is changing.\nJA: 状況は変わっています。" in saved
+
+
+def test_cancel_during_batch_retains_split_and_original_display():
+    h = TranslationHistory()
+    add(h, "Still")
+    target = h.reconstructions.plan(add(h, "live."))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(reconstruct(h, target, [{"end_tokens": [1]}, asyncio.CancelledError()]))
+    revision = h.reconstructions.entries()[0]
+    assert revision.chunks and not revision.paragraphs
+    assert revision.translation.translation_status == "cancelled"
+    assert [d["status"] for d in revision.decisions] == ["completed", "cancelled"]
+    assert len(h.reconstructions.effective_units()) == 2
+
+
+@pytest.mark.parametrize("status", ["incomplete", "completed"])
+def test_refusal_or_missing_parsed_response_is_not_applied(status):
+    from types import SimpleNamespace
+
+    h = TranslationHistory()
+    add(h, "Still")
+    target = h.reconstructions.plan(add(h, "live."))
+    calls = asyncio.run(
+        reconstruct(h, target, [SimpleNamespace(status=status, usage=None, output_parsed=None)])
+    )
+    assert len(calls) == 1
+    revision = h.reconstructions.entries()[0]
+    assert revision.translation.translation_status == "failed"
+    assert revision.decisions[0]["decision"] is None
+    assert not revision.chunks
+
+
+def test_failed_extension_keeps_previously_valid_revision():
+    h = TranslationHistory()
+    add(h, "The landscape is")
+    target = h.reconstructions.plan(add(h, "changing."))
+    asyncio.run(reconstruct(h, target, [{"end_tokens": [3]}, batch("状況は変化しています。")]))
+    extension = h.reconstructions.plan(add(h, "Reliability matters."))
+    asyncio.run(reconstruct(h, extension, [{"end_tokens": [3, 5]}, batch()]))
+    effective = h.reconstructions.effective_units()
+    assert len(effective) == 2 and effective[0][1] == (0, 1)
+    assert effective[0][0].ja_text == "状況は変化しています。"
+    assert effective[1][0].en_text == "Reliability matters."
+
+
+def test_usage_sums_split_and_translation_attempts():
+    from types import SimpleNamespace
+
+    h = TranslationHistory()
+    add(h, "Still")
+    target = h.reconstructions.plan(add(h, "live."))
+
+    def response(schema, data, count):
+        return SimpleNamespace(
+            status="completed",
+            output_parsed=schema.model_validate(data),
+            usage=SimpleNamespace(
+                model_dump=lambda: {
+                    "input_tokens": count,
+                    "output_tokens": 2,
+                    "total_tokens": count + 2,
+                }
+            ),
+        )
+
+    asyncio.run(
+        reconstruct(
+            h,
+            target,
+            [
+                response(EnglishSplit, {"end_tokens": [1]}, 10),
+                response(BatchTranslation, batch("まだ続いています。"), 20),
+            ],
+        )
+    )
+    usage = h.reconstructions.entries()[0].translation.usage
+    assert usage == {"input_tokens": 30, "output_tokens": 4, "total_tokens": 34}
