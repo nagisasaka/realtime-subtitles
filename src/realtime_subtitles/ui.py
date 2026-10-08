@@ -347,7 +347,7 @@ class SubtitleApp:
         details.pack(fill="x")
         ttk.Label(
             details,
-            text="確定EN 1行・ライブEN 2行・JA 2行。履歴は自動保存ファイルで確認できます。",
+            text="最新の英日字幕は上部に固定。下の履歴は新しい順に並び、スクロールで読み返せます。",
             wraplength=640,
         ).pack(anchor="w")
         ttk.Label(details, text=f"自動保存先: {self.autosave.directory}", wraplength=600).pack(
@@ -375,11 +375,15 @@ class SubtitleApp:
         ttk.Label(status, textvariable=self.level_text).pack(side="left")
         self.settings_button = ttk.Button(status, text="設定", command=self.show_settings, width=5)
         self.settings_button.pack(side="right")
+        self.latest_button = ttk.Button(
+            status, text="最新へ ↑", command=lambda: self.history_text.yview_moveto(0)
+        )
+        self.latest_button.pack(side="right", padx=(0, 6))
         self.speaker_var = tk.StringVar()
         ttk.Label(status, textvariable=self.speaker_var).pack(side="right", padx=16)
         self.progress = ttk.Progressbar(status, maximum=100, length=100)
         for widget in [status, *status.winfo_children()]:
-            if widget is not self.settings_button:
+            if widget not in (self.settings_button, self.latest_button):
                 widget.bind("<ButtonPress-1>", self._drag_start)
                 widget.bind("<B1-Motion>", self._drag_move)
 
@@ -467,17 +471,6 @@ class SubtitleApp:
             widget.bind("<B1-Motion>", self._drag_move)
         self.live_text = self.caption_widgets["live"]
         self.ja_text = self.caption_widgets["ja"]
-        self.history_header = tk.Frame(self.captions, bg=BG)
-        tk.Label(
-            self.history_header,
-            text="履歴 · 新しい順",
-            bg=BG,
-            fg="#8793a6",
-            font=("Yu Gothic UI", -round(12 * self.scale)),
-        ).pack(side="left")
-        ttk.Button(
-            self.history_header, text="最新へ ↑", command=lambda: self.history_text.yview_moveto(0)
-        ).pack(side="right")
         self.history_frame = tk.Frame(self.captions, bg=BG)
         self.history_text = tk.Text(
             self.history_frame,
@@ -507,22 +500,20 @@ class SubtitleApp:
     def _layout_captions(self):
         width = min(max(1, self.captions.winfo_width()), round(1100 * self.scale))
         x = max(0, (self.captions.winfo_width() - width) // 2)
-        gap = round(8 * self.scale)
+        gap = round(4 * self.scale)
         live = self.en_font.metrics("linespace") * 2
         ja = self.ja_font.metrics("linespace") * 2
-        header = round(34 * self.scale)
         # Translation arrival never changes the live English's screen position.
         self.ja_text.place(x=x, y=0, width=width, height=ja)
         self.live_text.place(x=x, y=ja + gap, width=width, height=live)
         history_y = ja + live + 2 * gap
-        self.history_header.place(x=x, y=history_y, width=width, height=header)
         self.history_frame.place(
             x=x,
-            y=history_y + header,
+            y=history_y,
             width=width,
-            height=max(1, self.captions.winfo_height() - history_y - header),
+            height=max(1, self.captions.winfo_height() - history_y),
         )
-        self.root.minsize(round(480 * self.scale), history_y + header + round(160 * self.scale))
+        self.root.minsize(round(480 * self.scale), history_y + round(160 * self.scale))
         self._render_key = None
         self._caption_layout.clear()
 
