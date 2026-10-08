@@ -180,6 +180,9 @@ class SubtitleApp:
         self._history_display_start = 0
         self._history_pending = {}
         self._history_rendered = set()
+        self._history_revision_pending = {}
+        self._history_group_for_unit = {}
+        self._history_english_runs = {}
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
         if audio_file is not None:
@@ -522,16 +525,31 @@ class SubtitleApp:
         self.settings_window.lift()
         return "break"
 
-    def _update_history_pairs(self, view, changed, display_start):
+    def _update_history_pairs(self, view, changed, display_start, revisions=()):
         text = self.history_text
         reset = self._history_display_start != display_start
         if reset:
             self._history_display_start = display_start
             self._history_pending.clear()
             self._history_rendered.clear()
+            self._history_revision_pending.clear()
+            self._history_group_for_unit.clear()
+            self._history_english_runs.clear()
+        for revision in revisions:
+            if (
+                revision.translation.translation_status == "completed"
+                and revision.paragraphs
+                and revision.translation.source_segment_ids[0] >= display_start
+            ):
+                self._history_revision_pending[revision.revision_id] = revision
         self._history_pending.update((u.unit_id, u) for u in changed)
         ready = [u for i, u in self._history_pending.items() if i <= view.history_latest_id]
-        if not ready and not reset:
+        applicable = [
+            r
+            for r in self._history_revision_pending.values()
+            if max(r.unit_ids) <= view.history_latest_id
+        ]
+        if not ready and not reset and not applicable:
             return
         # A mark follows inserts above the reader, including late translations.
         at_top = text.yview()[0] < 0.00001
@@ -546,6 +564,9 @@ class SubtitleApp:
             at_top = True
         for unit in sorted(ready, key=lambda u: u.unit_id):
             identity = unit.unit_id
+            if identity in self._history_group_for_unit:
+                del self._history_pending[identity]
+                continue  # Late original JA must not replace the reconstructed group.
             begin = f"pair_{identity}_start"
             ja_start, en_start = f"pair_{identity}_ja", f"pair_{identity}_en"
             speaker = f"↳ {unit.speaker or ''}\n" if unit.break_before else ""
@@ -578,19 +599,121 @@ class SubtitleApp:
                     text.mark_set(mark, f"1.0+{length}c")
                 for mark in (begin, ja_start, en_start):
                     text.mark_gravity(mark, "right")
+                end = f"pair_{identity}_end"
+                length = text.tk.call("string", "length", speaker + ja + unit.en_text + "\n")
+                text.mark_set(end, f"1.0+{length}c")
+                text.mark_gravity(end, "left")
+                self._history_english_runs[identity] = [
+                    (en_start, 0, text.tk.call("string", "length", unit.en_text))
+                ]
             self._history_rendered.add(identity)
             del self._history_pending[identity]
+        for revision in sorted(applicable, key=lambda r: r.revision_id):
+            del self._history_revision_pending[revision.revision_id]
+            if any(
+                self._history_group_for_unit.get(i, -1) > revision.revision_id
+                for i in revision.unit_ids
+            ):
+                continue  # A slower old response cannot undo a newer grouping.
+            if all(i in self._history_rendered for i in revision.unit_ids):
+                self._replace_history_group(revision)
         text.configure(state="disabled")
         if at_top:
             text.yview_moveto(0)
         else:
             text.yview("reading_position")
 
-    def _render_history(self):
-        view, changed, self._history_cursor, display_start = self.client.history.subtitle_frame(
-            self._history_cursor
+    def _replace_history_group(self, revision):
+        text = self.history_text
+        unit, ids = revision.translation, revision.unit_ids
+        start, end = f"pair_{max(ids)}_start", f"pair_{min(ids)}_end"
+        position = text.index(start)
+        within = text.compare("reading_position", ">=", start) and text.compare(
+            "reading_position", "<", end
         )
-        self._update_history_pairs(view, changed, display_start)
+        # Preserve an original-English character anchor across semantic splits.
+        # Japanese can now be inserted INSIDE an old unit, so keep individual runs.
+        anchor = None
+        for identity in ids:
+            for mark, local_offset, size in self._history_english_runs.get(identity, ()):
+                if (
+                    within
+                    and text.compare("reading_position", ">=", mark)
+                    and text.compare("reading_position", "<", f"{mark}+{size}c")
+                ):
+                    count = text.count(mark, "reading_position", "chars")
+                    anchor = (identity, local_offset + (count[0] if count else 0))
+        with self.client.history._lock:
+            originals = [self.client.history._segments[i] for i in ids]
+        text.delete(start, end)
+        speaker = f"↳ {unit.speaker or ''}\n" if unit.break_before else ""
+        chunks = [speaker, "speaker"]
+        rendered = speaker
+        english_runs = []
+
+        def size(value):
+            return int(text.tk.call("string", "length", value))
+
+        for paragraph in revision.paragraphs:
+            ja = paragraph.ja_text + "\n"
+            en = unit.en_text[paragraph.en_start : paragraph.en_end]
+            english_runs.append((paragraph, size(rendered + ja)))
+            chunks.extend((ja, "ja", en + "\n", "en"))
+            rendered += ja + en + "\n"
+        text.insert(position, *chunks)
+        prefix = 0
+        for original in originals:
+            identity = original.unit_id
+            raw = original.en_text.strip()
+            leading = size(
+                original.en_text[: len(original.en_text) - len(original.en_text.lstrip())]
+            )
+            for mark, _, _ in self._history_english_runs.get(identity, ()):
+                if "_run_" in mark:
+                    text.mark_unset(mark)
+            runs = []
+            for paragraph, rendered_start in english_runs:
+                lo, hi = max(prefix, paragraph.en_start), min(prefix + len(raw), paragraph.en_end)
+                if lo >= hi:
+                    continue
+                mark = f"pair_{identity}_run_{len(runs)}"
+                offset = rendered_start + size(unit.en_text[paragraph.en_start : lo])
+                text.mark_set(mark, f"{position}+{offset}c")
+                text.mark_gravity(mark, "right")
+                runs.append(
+                    (mark, leading + size(raw[: lo - prefix]), size(raw[lo - prefix : hi - prefix]))
+                )
+            self._history_english_runs[identity] = runs
+            marks = {
+                "start": position,
+                "ja": f"{position}+{size(speaker)}c",
+                "en": runs[0][0],
+                "end": f"{position}+{size(rendered)}c",
+            }
+            for suffix, index in marks.items():
+                mark = f"pair_{identity}_{suffix}"
+                text.mark_set(mark, index)
+                text.mark_gravity(mark, "left" if suffix == "end" else "right")
+            self._history_group_for_unit[identity] = revision.revision_id
+            prefix += len(raw) + 1
+        if within:
+            text.mark_set("reading_position", position)
+            if anchor:
+                identity, offset = anchor
+                for mark, local, length in self._history_english_runs[identity]:
+                    if local <= offset < local + length:
+                        text.mark_set("reading_position", f"{mark}+{offset - local}c")
+                        break
+
+    def _render_history(self):
+        previous_cursor = self._history_cursor
+        view, changed, self._history_cursor, display_start = self.client.history.subtitle_frame(
+            previous_cursor
+        )
+        revisions = self.client.history.reconstructions.changes(
+            previous_cursor, self._history_cursor
+        )
+        self._update_history_pairs(view, changed, display_start, revisions)
         width = max(1, self.live_text.winfo_width())
         key = (view, width)
         if key == self._render_key:

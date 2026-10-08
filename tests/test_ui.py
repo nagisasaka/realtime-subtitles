@@ -295,3 +295,102 @@ def test_final_pair_is_held_live_and_moves_as_a_whole_on_next_partial(app):
     assert "完結した文と、もう一文。\nOne complete sentence. And another." in app.history_text.get(
         "1.0", "end"
     )
+
+
+def test_llm_revision_waits_for_archive_and_replaces_pairs_without_late_overwrite(app):
+    h = app.client.history
+    make_unit(h, event("The landscape is", 0), "s")
+    last = make_unit(h, event("changing rapidly.", 1), "s")
+    target = h.reconstructions.plan(last)
+    complete_revision(h, target, "状況は急速に変化しています。")
+    app.pump()
+    assert app.live_text.cget("text") == "changing rapidly."
+    assert not app._history_group_for_unit
+    h.set_partial("Another live statement")
+    app.pump()
+    content = app.history_text.get("1.0", "end")
+    assert "状況は急速に変化しています。\nThe landscape is changing rapidly." in content
+    assert content.count("The landscape is") == 1 and content.count("changing rapidly.") == 1
+    h.update_translation(0, "completed", text="以前の断片訳")
+    app.pump()
+    assert "以前の断片訳" not in app.history_text.get("1.0", "end")
+    assert h.segments()[0].ja_text == "以前の断片訳"
+    h.clear_display()
+    app.pump()
+    assert not app.history_text.get("1.0", "end").strip()
+
+
+def test_revision_merge_preserves_reader_and_newer_response_wins(app):
+    h = app.client.history
+    units = []
+    for i in range(30):
+        units.append(make_unit(h, event(f"Sentence number {i}.", i), "s"))
+    a = h.reconstructions.plan(units[15])
+    b = h.reconstructions.plan(units[16])
+    app.pump()
+    text = app.history_text
+    text.yview("pair_15_en")
+    app.pump()
+    y = app.live_text.winfo_y()
+    complete_revision(h, b, "新しい再構成訳。")
+    app.pump()
+    assert "Sentence number 15." in text.get("@0,0", "@0,0 + 150 chars")
+    assert app.live_text.winfo_y() == y
+    complete_revision(h, a, "古い再構成訳。")
+    app.pump()
+    content = text.get("1.0", "end")
+    assert "古い再構成訳。" not in content and "新しい再構成訳。" in content
+    assert content.count("Sentence number 15.") == 1
+    assert "Sentence number 14. Sentence number 15. Sentence number 16." in content
+
+
+def test_semantic_paragraphs_can_split_inside_old_units_and_keep_reading_anchor(app):
+    from realtime_subtitles.history_reconstruction import ReconstructedParagraph
+
+    h = app.client.history
+    units = []
+    for i in range(25):
+        units.append(make_unit(h, event(f"Sentence number {i}.", i), "s"))
+    a = h.reconstructions.plan(units[15])
+    b = h.reconstructions.plan(units[16])
+    app.pump()
+    text = app.history_text
+    # Split within unit 15, which used to be indivisible in the history UI.
+    cut = a.en_text.index("number 15")
+    h.reconstructions.set_paragraphs(
+        a.unit_id,
+        (
+            ReconstructedParagraph(0, cut - 1, "最初の部分。"),
+            ReconstructedParagraph(cut, len(a.en_text), "後ろの部分。"),
+        ),
+    )
+    h.reconstructions.update_translation(a.unit_id, "completed", text="最初の部分。後ろの部分。")
+    app.pump()
+    assert "後ろの部分。\nnumber 15." in text.get("1.0", "end")
+    run = app._history_english_runs[15][1][0]
+    text.yview(run)
+    app.pump()
+    assert "number 15." in text.get("@0,0", "@0,0 lineend")
+    h.reconstructions.set_paragraphs(
+        b.unit_id,
+        (
+            ReconstructedParagraph(0, cut - 1, "新しい前半。"),
+            ReconstructedParagraph(cut, len(b.en_text), "新しい後半。"),
+        ),
+    )
+    h.reconstructions.update_translation(b.unit_id, "completed", text="新しい前半。新しい後半。")
+    app.pump()
+    assert "number 15." in text.get("@0,0", "@0,0 lineend")
+    content = text.get("1.0", "end")
+    assert content.count("Sentence number 14.") == 1
+    assert content.count("number 15.") == 1
+    assert "新しい後半。\nnumber 15. Sentence number 16." in content
+
+
+def complete_revision(history, target, japanese):
+    from realtime_subtitles.history_reconstruction import ReconstructedParagraph
+
+    history.reconstructions.set_paragraphs(
+        target.unit_id, (ReconstructedParagraph(0, len(target.en_text), japanese),)
+    )
+    history.reconstructions.update_translation(target.unit_id, "completed", text=japanese)

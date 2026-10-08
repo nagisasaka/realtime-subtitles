@@ -87,6 +87,9 @@ class TranslationHistory:
         self._last_speaker = None
         self.context_segments = max(0, context_segments)
         self.input_sessions = []
+        from .history_reconstruction import ReconstructionHistory
+
+        self.reconstructions = ReconstructionHistory(self)
 
     def begin_session(self, identity, metadata):
         with self._lock:
@@ -353,13 +356,23 @@ class TranslationHistory:
 
     def saved_text(self):
         parts = []
-        for s in self.segments():
+        for s, original_ids in self.reconstructions.effective_units():
             if s.break_before:
                 parts.append("\n---\n")
-            parts.append(
-                f"[#{s.sequence_id} {s.start_ms}–{s.end_ms} ms / {s.session_id}]\n"
-                f"EN: {s.en_text}\nJA: {s.ja_text or '[' + s.translation_status + ']'}\n"
-            )
+            if original_ids:
+                parts.append(f"[reconstructed units {','.join(map(str, original_ids))}]\n")
+            parts.append(f"[#{s.sequence_id} {s.start_ms}–{s.end_ms} ms / {s.session_id}]\n")
+            paragraphs = self.reconstructions.paragraphs_for(s.unit_id) if original_ids else ()
+            if paragraphs:
+                for paragraph in paragraphs:
+                    parts.append(
+                        f"EN: {s.en_text[paragraph.en_start : paragraph.en_end]}\n"
+                        f"JA: {paragraph.ja_text}\n"
+                    )
+            else:
+                parts.append(
+                    f"EN: {s.en_text}\nJA: {s.ja_text or '[' + s.translation_status + ']'}\n"
+                )
         included = {i for s in self.segments() for i in s.source_segment_ids}
         for source in self.sources():
             if source.segment_id not in included:
@@ -383,6 +396,13 @@ class TranslationHistory:
                                 **asdict(segment),
                             },
                             ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                for revision in self.reconstructions.entries():
+                    output.write(
+                        json.dumps(
+                            {"kind": "history_revision", **asdict(revision)}, ensure_ascii=False
                         )
                         + "\n"
                     )

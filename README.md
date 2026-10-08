@@ -18,6 +18,48 @@ Windows microphone (sounddevice、1デバイスのみ) / Audio File (PCM16 WAV�
 Speechmatics Translationは設定・使用しません。OpenAI Realtime Translation、別のRealtime英語接続、
 後追いdiarization API、fuzzy alignmentも標準経路では使用しません。音声はSpeechmaticsへ、確定英語テキストはOpenAIへ送ります。
 
+### 履歴の全文再翻訳と日英段落の再構成
+
+最新枠はこれまでどおり2-final単位で即時翻訳します。別workerで、同じ話者・同じ認識sessionの
+連続する履歴を**2〜3 TranslationUnits、最大1,800文字**の範囲で再構成します。
+2 unitsがそろった時点で依頼し、次のunitで最大3 unitsへ拡張して再度見直します。
+上限に達したら次の範囲へ進むため、無制限に過去全文を再送しません。
+
+Lunaへの指示と出力順序は次のとおりです。
+
+1. 範囲内の英語をひと続きの全文として自然な日本語へ再翻訳する。
+2. 英語を意味のまとまりで分割し、元の英語tokenの境界を指定する。
+3. 全文日本語訳から、その各英語範囲に対応する部分を順番に切り出す。
+
+元のfinalやTranslationUnitの途中にも段落を置けます。句読点・特定の語尾による結合判定はしません。
+[Responsesの構造化出力](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses)
+を使い、英語範囲が順序どおり全体を覆うこと、日本語部分を連結すると全文訳に戻ることを検査します。
+数値・通貨等は既存Validatorでも検査し、重大な異常は最大1回だけ再試行します。
+構造不正・APIエラー・検証失敗では既存の表示を維持します。構造検査は意味対応の正しさまで保証するものではありません。
+
+結果は全構成unitが履歴へ移ってから反映し、各段落の小さい日本語を英語の上に表示します。
+最新枠の表示・移動条件は変更しません。履歴内の再構成範囲は英文を読める順番で並べ、範囲同士は新しいものを上に置きます。
+元のASR英語・元の翻訳は変更せず、JSONLへ別の`history_revision`として全文訳・段落範囲・候補・検証結果を保存します。
+TXTには最新の有効な再構成を反映します。遅れて届いた古い翻訳や古い再構成結果は新しい表示を上書きしません。
+履歴内を読み直している間は、可能な限り元の英語文字位置を閲覧位置として保ちます。
+
+再構成は同じ`gpt-6-luna / reasoning.effort=none`の**追加API呼び出し**なので、入力・出力tokenの課金が増えます。
+専用workerは1並列・待ちqueueは最大2件。混雑時は再構成をskipし、元の字幕を残します。
+現在は既知の同一話者内だけが対象で、話者／session／Clearの境界を越えて再構成しません。
+Diagnosticsの`history_reconstruction`で件数・queue・失敗状態を確認できます。
+
+実APIの短い3例では、`The landscape is` / `changing.`が「状況は変化しています。」となり、
+後続文は別の日英段落になりました。再構成応答は1,653〜3,036ms、全3件valid・retryなしでした。
+これは小さな文例の実測であり、長い講演での翻訳品質・平均応答時間を示すものではありません。
+録音から取り出した別の実文例は4,400msで再構成できましたが、短い独立段落も残りました。
+すべての断片が必ず長い段落へまとまるわけではなく、意味のつながりはLLMの判断に依存します。
+
+Windowsの35秒WAVで途中Stop→再Start→EOFを確認。通常翻訳6件はすべて完了し、
+履歴再構成は2件完了、終了直前の1件は通貨検証後の再試行中に5秒の終了待ち上限でcancelledとなりました。
+その場合も元の訳を維持しました。Tkエラーなし、最新ENのY座標・ウィンドウ高さは一定、通常翻訳queue最大1でした。
+WSLテスト205件成功（12件skip）、Windowsテスト191件成功（1件skip）。
+原文保持、段落の欠落・重複検査、古い応答の排除、閲覧位置、失敗分離、自動保存を含みます。
+
 ## Gitの復元ポイント
 
 - `main`: 現在のSpeechmatics Agent STT + Luna翻訳版。
@@ -346,6 +388,7 @@ GUI更新はTk main threadの`after`だけです。マイクは1つだけ開き�
 | `text_translation.py` | `TRANSLATION_CONCURRENCY` | 4 |
 | `text_translation.py` | `TRANSLATION_QUEUE_SIZE` | 48 |
 | `text_translation.py` | `REQUEST_TIMEOUT_SEC` / `STOP_DRAIN_SEC` | 20 / 5秒 |
+| `history_reconstruction.py` | `MAX_REVISION_UNITS` / `MAX_REVISION_CHARS` | 3 units / 1,800文字 |
 | `agent_stt.py` | `AGENT_RATE` / `emit_sentences` | 16000 Hz / true |
 | `audio_recording.py` | `ROTATE_SECONDS` | 1800秒（30分） |
 
@@ -363,6 +406,9 @@ JSONLは約0.5秒ごとに追記してflush/fsync、TXTは約5秒ごとに一時
 JSONLの `kind="transcript"` 内の `record.kind="translation_unit"` がTranslationUnitのsnapshotです。
 `record.kind="raw_word_metadata"`は受信した場合のみ保存する別種のmetadataです。翻訳済み字幕として集計しないでください。
 同じsequence_idの後続recordは翻訳状態・結果の更新なので、復元時は**各sequence_idの最後のrecord**を採用してください。
+`record.kind="history_revision"`は別ID空間の再構成snapshotです。`revision_id`ごとに最後のrecordを採用し、
+completedの新しいrevisionを優先します。`unit_ids`が元のTranslationUnitsを示し、`paragraphs`が
+結合原文内の文字範囲と対応JAを保持します。原文と再構成を両方連結してはいけません。
 元のENは更新で置換しません。`partial_snapshot`は未確定英語で、確定全文へ足し合わせません。
 start_ms / end_msはSpeechmatics session内の音声時刻、received_monotonic_msは到着時刻です。別の時刻として保存します。
 

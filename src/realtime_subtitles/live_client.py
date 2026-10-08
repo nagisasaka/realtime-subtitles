@@ -41,6 +41,8 @@ class LiveClient:
         self.playback_state = "Idle"
         self.speechmatics_factory = speechmatics_factory
         self.translation_factory = translation_factory
+        self.reconstruction = None
+        self.reconstruction_error = ""
         self.state = State.STOPPED
         self.error = ""
         self.mic = self.speechmatics = self.translation = None
@@ -81,6 +83,13 @@ class LiveClient:
         unit = self.history.emit_unit(sources, reason, now_ms)
         if self.translation:
             self.translation.submit(unit)
+            if self.reconstruction:
+                try:
+                    target = self.history.reconstructions.plan(unit)
+                    if target:
+                        self.reconstruction.submit(target)
+                except Exception as exc:
+                    self.reconstruction_error = type(exc).__name__
         else:
             self.history.update_translation(unit.sequence_id, "cancelled")
 
@@ -163,7 +172,8 @@ class LiveClient:
         self.monitor = None
         self.recorder = None
         self.recording_error = ""
-        self.translation = self.speechmatics = None
+        self.translation = self.speechmatics = self.reconstruction = None
+        self.reconstruction_error = ""
         failed = False
         eof = False
         capture_started = False
@@ -176,6 +186,16 @@ class LiveClient:
             self.mic.prepare()
             self.translation = self.translation_factory(self.history, os.environ["OPENAI_API_KEY"])
             self.translation.start()
+            try:
+                from .history_reconstruction import make_reconstruction_worker
+
+                self.reconstruction = make_reconstruction_worker(
+                    self.history.reconstructions, os.environ["OPENAI_API_KEY"]
+                )
+                self.reconstruction.start()
+            except Exception as exc:
+                self.reconstruction_error = type(exc).__name__
+                self.reconstruction = None
             self.speechmatics = self.speechmatics_factory(
                 on_event=self._receive, on_session=self._session_changed
             )
@@ -277,7 +297,12 @@ class LiveClient:
             # EOS may emit additional finals; only now stop accepting translation jobs.
             if self.translation:
                 self.translation.finish()
+            if self.reconstruction:
+                self.reconstruction.finish()
+            if self.translation:
                 self.translation.join()
+            if self.reconstruction:
+                self.reconstruction.join()
             self.history.set_partial("")
             self.state = State.ERROR if failed else State.STOPPED
             self.playback_state = "Error" if failed else "Finished" if eof else "Idle"
@@ -311,6 +336,13 @@ class LiveClient:
             "speechmatics": sm,
             "translation_status": counts,
             "assembler": self.assembler.snapshot(),
+            "history_reconstruction": {
+                "status": self.history.reconstructions.statistics(),
+                "queue": self.reconstruction.jobs.qsize() if self.reconstruction else 0,
+                "in_flight": self.reconstruction.in_flight if self.reconstruction else 0,
+                "error": self.reconstruction_error
+                or (self.reconstruction.error if self.reconstruction else ""),
+            },
             "translation_queue": self.translation.jobs.qsize() if self.translation else 0,
             "translations_in_flight": self.translation.in_flight if self.translation else 0,
             "frames_dispatched": self.frames_dispatched,

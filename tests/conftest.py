@@ -28,3 +28,20 @@ def make_unit(history, event, session):
         if source
         else None
     )
+
+
+@pytest.fixture(autouse=True)
+def no_external_history_reconstruction(monkeypatch):
+    class KeepOriginal:
+        def __init__(self, key, history):
+            pass
+
+        async def translate(self, *args, **kwargs):
+            raise RuntimeError("Reconstruction API disabled in offline tests")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "realtime_subtitles.history_reconstruction.ReconstructionTranslator", KeepOriginal
+    )
