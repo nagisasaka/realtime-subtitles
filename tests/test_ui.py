@@ -430,11 +430,9 @@ def test_monitor_dpi_updates_pixel_fonts_and_layout_without_recreating_widgets(a
     assert app.en_size._tk.globalgetvar(app.en_size._name) == ""
 
 
-def test_native_monitor_roundtrip_keeps_logical_geometry(app):
+def native_monitor_origins():
     import ctypes
     from ctypes import wintypes
-
-    from realtime_subtitles.ui import window_dpi
 
     rectangles = []
     callback_type = ctypes.WINFUNCTYPE(
@@ -453,6 +451,13 @@ def test_native_monitor_roundtrip_keeps_logical_geometry(app):
     ctypes.windll.user32.EnumDisplayMonitors(None, None, callback, 0)
     if len(rectangles) < 2:
         pytest.skip("Requires two native Windows displays")
+    return rectangles
+
+
+def test_native_monitor_roundtrip_keeps_logical_geometry(app):
+    from realtime_subtitles.ui import window_dpi
+
+    rectangles = native_monitor_origins()
     states = []
     app.en_size.set(20)
     app._font_changed()
@@ -469,3 +474,73 @@ def test_native_monitor_roundtrip_keeps_logical_geometry(app):
         assert abs(height / dpi - states[0][2] / states[0][0]) < 0.02
     app._save_settings()
     assert app.settings.geometry_dpi == states[-1][0]
+
+
+def test_settings_dpi_is_independent_and_padding_does_not_accumulate(app, monkeypatch):
+    from tkinter import ttk
+
+    settings_dpi = [240]
+    monkeypatch.setattr(
+        "realtime_subtitles.ui.window_dpi",
+        lambda w: settings_dpi[0] if w is app.settings_window else 168,
+    )
+    monkeypatch.setattr("realtime_subtitles.ui.resize_client_for_dpi", lambda *a: None)
+    app.show_settings()
+    app.pump()
+    main_font_size = app.en_font.cget("size")
+    main_geometry = app.root.geometry()
+    original_widgets = tuple(app._settings_layout)
+    for dpi in (240, 168, 240, 168, 240):
+        settings_dpi[0] = dpi
+        app.pump()
+        assert app.settings_scale == dpi / 96
+        assert app.settings_font.cget("size") == -round(12 * dpi / 96)
+        assert app.en_font.cget("size") == main_font_size
+        assert app.root.geometry() == main_geometry
+        assert tuple(app._settings_layout) == original_widgets
+        assert str(app.microphone.cget("font")) == str(app.settings_font)
+        assert str(ttk.Style(app.root).lookup("Settings.TButton", "font")) == str(app.settings_font)
+        padding = app.mic_panel.cget("padding")
+        assert tuple(app.root.winfo_pixels(v) for v in padding) == tuple(
+            round(v * dpi / 96) for v in (12, 0, 12, 8)
+        )
+    app._settings_dropdown(app.microphone)
+    popup = app.root.tk.call("ttk::combobox::PopdownWindow", str(app.microphone))
+    assert str(app.root.tk.call(f"{popup}.f.l", "cget", "-font")) == str(app.settings_font)
+    app.source.set("audio_file")
+    app._source_changed()
+    app.pump()
+    assert app.file_info_label.pack_info()["padx"] == 30
+    assert app.monitor_check.pack_info()["padx"] == 30
+    app.settings_window.withdraw()
+    app.pump()
+    settings_dpi[0] = 168
+    app.show_settings()
+    app.pump()
+    assert app.settings_font.cget("size") == -21
+    assert app.file_info_label.pack_info()["padx"] == 21
+    assert app.en_font.cget("size") == main_font_size
+
+
+def test_native_settings_and_subtitles_on_separate_displays(app):
+    from realtime_subtitles.ui import window_dpi
+
+    first, second = native_monitor_origins()[:2]
+    app.en_size.set(20)
+    app._font_changed()
+    for main, dialog in [(first, second), (second, first), (first, second)]:
+        app.root.geometry(f"+{main[0] + 100}+{main[1] + 100}")
+        app.show_settings()
+        settings = app.settings_window
+        settings.geometry(f"+{dialog[0] + 100}+{dialog[1] + 100}")
+        app.pump(0.4)
+        assert app.en_font.cget("size") == -round(20 * window_dpi(app.root) / 96)
+        assert app.settings_font.cget("size") == -round(12 * window_dpi(settings) / 96)
+        assert settings.winfo_width() == settings.winfo_reqwidth()
+        assert settings.winfo_height() == settings.winfo_reqheight()
+        for widget in app._settings_layout:
+            if widget.winfo_viewable():
+                x = widget.winfo_rootx() - settings.winfo_rootx()
+                y = widget.winfo_rooty() - settings.winfo_rooty()
+                assert 0 <= x <= settings.winfo_width() - widget.winfo_width()
+                assert 0 <= y <= settings.winfo_height() - widget.winfo_height()

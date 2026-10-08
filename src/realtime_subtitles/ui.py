@@ -346,7 +346,9 @@ class SubtitleApp:
             command=self._schedule_save,
         )
         self.file_info = tk.StringVar()
-        self.file_info_label = ttk.Label(self.settings_window, textvariable=self.file_info)
+        self.file_info_label = ttk.Label(
+            self.settings_window, textvariable=self.file_info, wraplength=640
+        )
 
         options = ttk.Frame(self.settings_window, padding=12)
         options.pack(fill="x")
@@ -457,6 +459,100 @@ class SubtitleApp:
                 widget.bind("<ButtonPress-1>", self._drag_start)
                 widget.bind("<B1-Motion>", self._drag_move)
 
+        self._init_settings_dpi()
+
+    def _init_settings_dpi(self):
+        self.settings_scale = None
+        self.settings_font = font.Font(family="Segoe UI", size=-round(12 * self.scale))
+        self._settings_layout = {}
+        self._settings_fit_pending = False
+        self._settings_fitted_request = None
+
+        def distances(widget, value):
+            values = widget.tk.splitlist(value if isinstance(value, tuple) else str(value))
+            return tuple(widget.winfo_pixels(v) for v in values)
+
+        pending = list(self.settings_window.winfo_children())
+        while pending:
+            widget = pending.pop()
+            layout = {}
+            keys = widget.keys()
+            if "style" in keys:
+                base = str(widget.cget("style")) or widget.winfo_class()
+                if isinstance(widget, ttk.Scale):
+                    base = "Horizontal.TScale"
+                widget.configure(style="Settings." + base)
+            if "font" in keys:
+                widget.configure(font=self.settings_font)
+            if "padding" in keys:
+                layout["padding"] = distances(widget, widget.cget("padding"))
+            if "wraplength" in keys:
+                layout["wraplength"] = widget.winfo_pixels(widget.cget("wraplength") or 0)
+            if widget.winfo_manager() == "pack":
+                info = widget.pack_info()
+                layout["pack"] = {key: distances(widget, info[key]) for key in ("padx", "pady")}
+            if widget in (self.monitor_check, self.file_info_label):
+                layout["pack"] = {"padx": (12,), "pady": (0,)}
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(postcommand=lambda w=widget: self._settings_dropdown(w))
+            self._settings_layout[widget] = layout
+            pending.extend(widget.winfo_children())
+
+    def _settings_dropdown(self, combo):
+        # Tk's popdown Listbox otherwise uses the process-wide TkTextFont.
+        popup = combo.tk.call("ttk::combobox::PopdownWindow", str(combo))
+        combo.tk.call(f"{popup}.f.l", "configure", "-font", self.settings_font)
+
+    def _refresh_settings_dpi(self):
+        window = self.settings_window
+        if not window.winfo_ismapped():
+            return
+        scale = window_dpi(window) / 96.0
+        if scale == self.settings_scale:
+            requested = window.winfo_reqwidth(), window.winfo_reqheight()
+            if self._settings_fit_pending or requested != self._settings_fitted_request:
+                self._settings_fit_pending = False
+                self._settings_fitted_request = requested
+                if window.state() == "normal":
+                    resize_client_for_dpi(window, *requested)
+            return
+        self.settings_scale = scale
+        self.settings_font.configure(size=-round(12 * scale))
+        style = ttk.Style(self.root)
+        for base in (
+            "TLabel",
+            "TButton",
+            "TCheckbutton",
+            "TRadiobutton",
+            "TCombobox",
+            "TSpinbox",
+            "TEntry",
+        ):
+            style.configure("Settings." + base, font=self.settings_font)
+        style.configure("Settings.TButton", padding=(round(9 * scale), round(5 * scale)))
+        for base in ("TCombobox", "TSpinbox"):
+            style.configure("Settings." + base, arrowsize=round(12 * scale))
+        style.configure(
+            "Settings.Horizontal.TScale",
+            sliderlength=round(30 * scale),
+            arrowsize=round(15 * scale),
+        )
+        for widget, layout in self._settings_layout.items():
+            if layout.get("padding"):
+                widget.configure(padding=tuple(round(v * scale) for v in layout["padding"]))
+            if layout.get("wraplength"):
+                widget.configure(wraplength=round(layout["wraplength"] * scale))
+            if "pack" in layout and widget.winfo_manager() == "pack":
+                widget.pack_configure(
+                    **{
+                        key: tuple(round(v * scale) for v in values)
+                        for key, values in layout["pack"].items()
+                    }
+                )
+        if window.state() == "normal":
+            window.geometry("")  # Refit the dialog to its independently scaled controls.
+        self._settings_fit_pending = True  # Correct the native frame after layout settles.
+
     def _source_changed(self):
         if self.client.active:
             return
@@ -466,14 +562,24 @@ class SubtitleApp:
         self.monitor_check.pack_forget()
         if self.source.get() == "audio_file":
             self.file_panel.pack(fill="x", before=self.options_panel)
-            self.file_info_label.pack(fill="x", padx=12, before=self.options_panel)
-            self.monitor_check.pack(fill="x", padx=12, before=self.options_panel)
+            self.file_info_label.pack(
+                fill="x",
+                padx=round(12 * (self.settings_scale or self.scale)),
+                before=self.options_panel,
+            )
+            self.monitor_check.pack(
+                fill="x",
+                padx=round(12 * (self.settings_scale or self.scale)),
+                before=self.options_panel,
+            )
             self.progress.pack(side="left", padx=10)
             self._inspect_file()
         else:
             self.mic_panel.pack(fill="x", before=self.options_panel)
             self.progress.pack_forget()
             self.refresh_devices()
+        self.settings_window.geometry("")
+        self._settings_fit_pending = True
         self._schedule_save()
 
     def _browse_file(self):
@@ -595,6 +701,7 @@ class SubtitleApp:
         self._caption_layout.clear()
 
     def show_settings(self, event=None):
+        self._settings_fit_pending = True
         self.settings_window.deiconify()
         self.settings_window.lift()
         return "break"
@@ -1179,8 +1286,13 @@ class SubtitleApp:
         except queue.Empty:
             pass
         self._refresh_dpi()  # Includes initial map and DPI changes without a resize.
+        self._refresh_settings_dpi()
         snapshot = self.client.snapshot()
-        snapshot["display"] = {"dpi": round(self.scale * 96), "scale": self.scale}
+        snapshot["display"] = {
+            "dpi": round(self.scale * 96),
+            "scale": self.scale,
+            "settings_dpi": round(self.settings_scale * 96) if self.settings_scale else None,
+        }
         is_file = self.source.get() == "audio_file"
         self.status_var.set(
             snapshot.get("playback_state", "Idle") if is_file else snapshot["state"]
