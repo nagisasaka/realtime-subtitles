@@ -147,12 +147,26 @@ def test_bad_missing_and_truncated_wav(tmp_path):
     source.stop()
 
 
-def test_file_uses_production_pipeline_eos_restart_and_metadata(tmp_path, monkeypatch):
+@pytest.mark.parametrize("monitor_enabled", [False, True])
+def test_file_uses_production_pipeline_eos_restart_and_metadata(
+    tmp_path, monkeypatch, monitor_enabled
+):
     path = tmp_path / "voice.wav"
     wav_file(path)
     for key in ("OPENAI_API_KEY", "SPEECHMATICS_API_KEY"):
         monkeypatch.setenv(key, "test")
     calls, endings, starts, audio = [], [], [], []
+    monitors = []
+
+    def monitor_factory():
+        from realtime_subtitles.audio_monitor import AudioMonitor
+
+        def unavailable():
+            raise OSError("test output unavailable")
+
+        monitor = AudioMonitor(output_factory=unavailable)
+        monitors.append(monitor)
+        return monitor
 
     class Translator:
         def __init__(self, key):
@@ -202,6 +216,7 @@ def test_file_uses_production_pipeline_eos_restart_and_metadata(tmp_path, monkey
             endpoint = f"ws://127.0.0.1:{sock.sockets[0].getsockname()[1]}"
             client = LiveClient(
                 microphone_factory=no_mic,
+                monitor_factory=monitor_factory,
                 recorder_factory=no_mic,
                 speechmatics_factory=lambda **kw: AgentSttClient(endpoint=endpoint, **kw),
                 translation_factory=lambda h, k: TranslationWorker(
@@ -210,13 +225,16 @@ def test_file_uses_production_pipeline_eos_restart_and_metadata(tmp_path, monkey
             )
             for _ in range(2):
                 started = time.monotonic()
-                assert client.start(audio_file=str(path))
+                assert client.start(audio_file=str(path), audio_monitor=monitor_enabled)
                 assert not client.start(audio_file=str(path))
                 assert await asyncio.to_thread(client.join, 5)
                 assert time.monotonic() - started >= 0.45
                 assert client.playback_state == "Finished", client.snapshot()
                 assert client.snapshot()["position_ms"] == 450
             assert len(endings) == 2 and len(calls) == 2
+            assert len(monitors) == (2 if monitor_enabled else 0)
+            assert all(m.error and not m.thread.is_alive() for m in monitors)
+
             assert [len(x) for x in audio] == [14400, 14400]
             assert audio[0] == audio[1]
             assert all(context == [] for _, context in calls)

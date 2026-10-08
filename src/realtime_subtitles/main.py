@@ -17,7 +17,7 @@ def console(args):
     seen = set()
     partial = None
     next_diagnostic = 0.0
-    client.start(args.device, audio_file=args.audio_file)
+    client.start(args.device, audio_file=args.audio_file, audio_monitor=args.audio_monitor)
     started = time.monotonic()
 
     def print_updates():
@@ -101,7 +101,14 @@ def main():
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--seconds", type=float, help="Stop console mode after this many seconds")
     parser.add_argument("--save", help="Save console transcript history as UTF-8 JSONL")
+    parser.add_argument(
+        "--audio-monitor",
+        action="store_true",
+        help="Play file audio through Windows default output (console)",
+    )
     args = parser.parse_args()
+    if args.audio_monitor and (not args.audio_file or not args.console):
+        parser.error("--audio-monitor requires --console --audio-file; use Settings for GUI")
     if sys.platform != "win32":
         print(
             "Windows側のPythonで起動してください。WSLではunit testのみ実行できます。",

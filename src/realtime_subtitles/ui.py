@@ -269,6 +269,13 @@ class SubtitleApp:
         self.file_entry.bind("<FocusOut>", lambda _: self._inspect_file())
         self.browse_button = ttk.Button(self.file_panel, text="Browse…", command=self._browse_file)
         self.browse_button.pack(side="left", padx=5)
+        self.monitor_enabled = tk.BooleanVar(value=self.settings.audio_monitor)
+        self.monitor_check = ttk.Checkbutton(
+            self.settings_window,
+            text="音声モニター：Windowsの既定出力で再生（開始前に選択）",
+            variable=self.monitor_enabled,
+            command=self._schedule_save,
+        )
         self.file_info = tk.StringVar()
         self.file_info_label = ttk.Label(self.settings_window, textvariable=self.file_info)
 
@@ -378,9 +385,11 @@ class SubtitleApp:
         self.mic_panel.pack_forget()
         self.file_panel.pack_forget()
         self.file_info_label.pack_forget()
+        self.monitor_check.pack_forget()
         if self.source.get() == "audio_file":
             self.file_panel.pack(fill="x", before=self.options_panel)
             self.file_info_label.pack(fill="x", padx=12, before=self.options_panel)
+            self.monitor_check.pack(fill="x", padx=12, before=self.options_panel)
             self.progress.pack(side="left", padx=10)
             self._inspect_file()
         else:
@@ -402,7 +411,9 @@ class SubtitleApp:
     def _inspect_file(self):
         path = self.file_path.get()
         if not path:
-            self.file_info.set("PCM16 WAV / mono・stereo。音声モニター OFF（スピーカー再生なし）")
+            self.file_info.set(
+                "PCM16 WAV / mono・stereo。音声モニターは下のチェックで選択できます。"
+            )
             return
 
         def work():
@@ -653,6 +664,7 @@ class SubtitleApp:
         self.settings.japanese_weight = self.ja_weight.get()
         self.settings.input_source = self.source.get()
         self.settings.audio_file = self.file_path.get()
+        self.settings.audio_monitor = self.monitor_enabled.get()
         self.settings.transparency = max(0, min(70, round(self.transparency.get())))
         try:
             self.settings.save(self.settings_file)
@@ -680,7 +692,9 @@ class SubtitleApp:
         device = self.devices[index - 1].index if index > 0 else None
         self._save_settings()
         self.client.start(
-            device, audio_file=self.file_path.get() if self.source.get() == "audio_file" else None
+            device,
+            audio_file=self.file_path.get() if self.source.get() == "audio_file" else None,
+            audio_monitor=self.monitor_enabled.get(),
         )
 
     def save_transcript(self):
@@ -795,7 +809,7 @@ class SubtitleApp:
                             if isinstance(info, str)
                             else f"{info['audio_duration_ms'] / 1000:.1f}s · WAV / "
                             f"{info['audio_sample_rate'] / 1000:g} kHz / "
-                            f"{info['audio_channels']} ch · PCM16 · モニター OFF"
+                            f"{info['audio_channels']} ch · PCM16"
                         )
                 elif kind == "device_error":
                     self.refreshing = False
@@ -825,6 +839,7 @@ class SubtitleApp:
         snapshot["autosave"] = self.autosave.snapshot()
         self.error_var.set(
             self.autosave.error
+            or snapshot.get("audio_monitor", {}).get("error")
             or snapshot.get("recording", {}).get("error")
             or snapshot.get("translation_error")
             or snapshot["error"]
@@ -837,6 +852,7 @@ class SubtitleApp:
         self.stop_button.configure(state="normal" if self.client.active else "disabled")
         self.microphone.configure(state="disabled" if busy else "readonly")
         for control in [
+            self.monitor_check,
             self.refresh_button,
             self.browse_button,
             self.file_entry,

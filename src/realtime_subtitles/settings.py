@@ -15,6 +15,7 @@ class Settings:
     microphone: str = ""
     input_source: str = "microphone"
     audio_file: str = ""
+    audio_monitor: bool = False
     geometry: str = ""
     english_size: int = 30
     japanese_size: int = 29

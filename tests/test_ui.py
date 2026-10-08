@@ -141,9 +141,12 @@ def test_controls_fonts_dpi_drag_clickthrough_and_missing_file(app, tmp_path):
     app.pump()
     assert "見つかりません" in app.file_info.get()
     assert app.file_entry.winfo_viewable() and not app.microphone.winfo_viewable()
+    app.monitor_enabled.set(True)
+    assert app.monitor_check.winfo_viewable()
     app._save_settings()
     saved = Settings.load(app.settings_file)
     assert saved.input_source == "audio_file" and saved.english_size == 32
+    assert saved.audio_monitor is True
 
 
 def test_save_remains_nonmodal_and_late_ja_does_not_replace_current(app, tmp_path, monkeypatch):

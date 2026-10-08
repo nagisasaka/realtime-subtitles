@@ -36,7 +36,7 @@ git worktree add --detach ../realtime-subtitles-openai openai-stable-v1
 ## Windows要件と環境構築
 
 Windows 11、ネイティブWindows Python 3.12以上（tkinter同梱）、ネット接続、両社のAPIキーが必要です。マイクはMicrophoneモードだけで必要です。
-Qt / Electron / WASAPI loopback / WSLg audioは使用しません。音声の再生も行いません。
+Qt / Electron / WASAPI loopback / WSLg audioは使用しません。音声ファイルでは、任意でWindowsの既定出力から音声モニターを再生できます。
 
 Windows PowerShellで:
 
@@ -96,7 +96,8 @@ PowerShellスクリプトが許可された環境では `scripts\run-windows.ps1
 対応は非圧縮 **PCM16 WAV / mono・stereo / 8〜192kHz（44.1/48kHz含む）**。
 Float32 WAV・MP3・M4Aは未対応です。標準ライブラリ`wave`で約200msずつ読み、ファイル全体をメモリへ載せません。
 既存のmono化・soxr変換を通してAgent STTへ16kHz PCM16を送ります。最終端数chunkを無音で水増ししません。
-ノイズ除去・音量補正・VAD・速度変更は行いません。**音声モニターはOFF、スピーカー再生機能はありません。**
+ノイズ除去・音量補正・VAD・速度変更は行いません。**音声モニターは初期値OFF。設定のチェックをONにしてからStartすると、Windowsの既定スピーカー／ヘッドホンで再生します。**
+再生も音声ファイルモード専用です。マイク入力のモニターは行いません。
 ファイルモードではマイク・録音workerを開かず、既存音源の複製録音も行いません。
 
 読み込み・送信の予定時刻はmonotonic clockで管理します。通常は音声時間に沿って200ms間隔で送り、
@@ -105,10 +106,24 @@ Float32 WAV・MP3・M4Aは未対応です。標準ライブラリ`wave`で約200
 EOFでは正常EOSを待ち、Assemblerをflushし、翻訳は既存の最大5秒drain、TXT/JSONLの最終保存後にFinished表示。
 EOSを確認できなければErrorとし、得られた履歴を保持します。Start連打による二重送信はしません。
 
+音声モニターは送信された24kHz mono PCMを独立workerへ渡し、出力デバイスのnative sample rateへ変換します。
+同じ音声を聞きながら字幕の到着を確認できますが、出力機器のバッファ遅延があるため厳密な同期計測用ではありません。
+3 chunkのbounded queueで再生が遅れた古い音声を捨て、再生待ちでASR・翻訳を停止させません。
+Stopは再生も停止し、EOFでは末尾を再生して出力を閉じます。再Startで新しい出力streamを開きます。
+再生先エラーは設定画面に表示し、字幕は継続します。設定は保存され、再生中のON/OFF変更は無効です。
+Windows側の音量・既定出力設定を使用します。アプリからOS音量は変更しません。
+出力バッファは100msを要求し、実際の値はDiagnosticsの`output_latency_ms`へ表示します。
+出力準備は最大3秒待ち、Bluetooth等の初期化中に冒頭を捨てることを防ぎます。
+WindowsのWF-1000XM6出力で、3秒でStop→同じWAVを12秒再StartしてEOFを確認しました。
+最終検証では再生drop・underflow・出力エラーは0、報告された出力latencyは102ms、5件の翻訳はすべてcompletedでした。
+これはWindows出力streamへの書き込み・drainの確認であり、耳に届くまでのBluetooth遅延は測定していません。
+
 同じ認識・翻訳経路をconsoleから使う場合:
 
 ```powershell
 .\.venv-win\Scripts\python.exe -m realtime_subtitles --console --audio-file C:\Recordings\talk.wav --diagnostic
+# 音声も聞く場合:
+.\.venv-win\Scripts\python.exe -m realtime_subtitles --console --audio-file C:\Recordings\talk.wav --audio-monitor
 # GUIでファイルをあらかじめ選択（Startは手動）:
 .\.venv-win\Scripts\pythonw.exe -m realtime_subtitles --audio-file C:\Recordings\talk.wav
 ```

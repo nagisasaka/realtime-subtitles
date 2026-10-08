@@ -1,7 +1,7 @@
 """Incremental WAV input with the same 24 kHz PCM interface as Microphone.
 
-AgentSttClient performs the existing final 16 kHz conversion. No output device is
-opened, and no normalization, denoising, silence removal or speed change occurs.
+AgentSttClient performs the existing final 16 kHz conversion. This source opens
+no devices; optional playback is isolated downstream. No acoustic enhancement occurs.
 """
 
 import math

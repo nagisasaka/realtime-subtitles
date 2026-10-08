@@ -8,6 +8,7 @@ import time
 from .agent_stt import AgentSttClient
 from .audio import AudioError, Microphone
 from .audio_file import AudioFileSource
+from .audio_monitor import AudioMonitor
 from .audio_recording import AudioRecorder
 from .realtime_api import State
 from .text_translation import TranslationWorker
@@ -25,6 +26,7 @@ class LiveClient:
         history=None,
         recorder_factory=AudioRecorder,
         file_factory=AudioFileSource,
+        monitor_factory=AudioMonitor,
     ):
         self.history = history if history is not None else TranslationHistory()
         self.recorder_factory = recorder_factory
@@ -33,6 +35,8 @@ class LiveClient:
         self.assembler = TranslationUnitAssembler(self._emit_unit, clock=self.history.clock)
         self.microphone_factory = microphone_factory
         self.file_factory = file_factory
+        self.monitor_factory = monitor_factory
+        self.monitor = None
         self.input_source = "microphone"
         self.playback_state = "Idle"
         self.speechmatics_factory = speechmatics_factory
@@ -49,7 +53,7 @@ class LiveClient:
     def active(self):
         return bool(self.thread and self.thread.is_alive())
 
-    def start(self, device_index=None, *, audio_file=None):
+    def start(self, device_index=None, *, audio_file=None, audio_monitor=False):
         if self.active:
             return False
         self.error = ""
@@ -65,7 +69,10 @@ class LiveClient:
         self.frames_dispatched = 0
         self.state = State.CONNECTING
         self.thread = threading.Thread(
-            target=self._run, args=(device_index, audio_file), name="live-subtitles", daemon=False
+            target=self._run,
+            args=(device_index, audio_file, audio_monitor),
+            name="live-subtitles",
+            daemon=False,
         )
         self.thread.start()
         return True
@@ -109,6 +116,8 @@ class LiveClient:
 
     def stop(self):
         self.stop_requested.set()
+        if self.monitor:
+            self.monitor.stop()
         self.assembler.flush("stop")
         if self.active:
             self.state = State.STOPPING
@@ -147,8 +156,9 @@ class LiveClient:
                     self.mic.meter(frame[1])
                 self.frames_dispatched += 1
 
-    def _run(self, device, audio_file=None):
+    def _run(self, device, audio_file=None, audio_monitor=False):
         self.mic = None
+        self.monitor = None
         self.recorder = None
         self.recording_error = ""
         self.translation = self.speechmatics = None
@@ -170,6 +180,10 @@ class LiveClient:
             if audio_file is not None:
                 self.speechmatics.file_input = True
                 self.speechmatics.on_audio_sent = self.mic.note_sent
+                if audio_monitor:
+                    self.monitor = self.monitor_factory()
+                    self.monitor.start()
+                    self.speechmatics.on_audio_frame = self.monitor.submit
             if not self.speechmatics.start():
                 raise RuntimeError("Speechmatics startup")
             while not self.stop_requested.is_set() and not self.speechmatics.session_ready:
@@ -185,6 +199,18 @@ class LiveClient:
                     self.mic.frames.sinks = (*self.mic.frames.sinks, self.recorder)
                 except Exception as exc:
                     self.recording_error = type(exc).__name__
+            if self.monitor:
+                until = time.monotonic() + 3
+                while not self.monitor.ready.is_set() and not self.stop_requested.is_set():
+                    if time.monotonic() >= until:
+                        self.monitor.error = (
+                            "音声出力の準備がタイムアウトしました。字幕は継続します。"
+                        )
+                        self.monitor.stop()
+                        break
+                    self.stop_requested.wait(0.02)
+            if self.stop_requested.is_set():
+                return
             self.mic.start()
             capture_started = True
             while not self.stop_requested.is_set():
@@ -238,6 +264,8 @@ class LiveClient:
                 ):
                     failed = True
                     self.error = self.speechmatics.error or "正常なEOSを確認できませんでした。"
+            if self.monitor:
+                self.monitor.close(drain=eof and not self.stop_requested.is_set())
             if self.recorder:
                 try:
                     self.recorder.close()
@@ -271,6 +299,7 @@ class LiveClient:
         return {
             "backend": "speechmatics-agent-stt + openai-text",
             "state": self.state.value,
+            "audio_monitor": self.monitor.snapshot() if self.monitor else {},
             "input_source": self.input_source,
             "playback_state": self.playback_state,
             "error": self.error or sm.get("error", ""),

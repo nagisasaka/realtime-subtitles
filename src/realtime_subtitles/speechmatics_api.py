@@ -221,6 +221,7 @@ class SpeechmaticsClient:
         self.session_ready = False
         self.file_input = False
         self.on_audio_sent = None
+        self.on_audio_frame = None
         self.eos_received = False
 
     @property
@@ -365,6 +366,8 @@ class SpeechmaticsClient:
                     payload = self._encode_audio(frame)
                     if payload:
                         await self._send_audio(client, payload)
+                    if self.on_audio_frame:
+                        self.on_audio_frame(frame)
                     pacer.sent()
                     if self.on_audio_sent:
                         self.on_audio_sent(len(frame) // 2)
