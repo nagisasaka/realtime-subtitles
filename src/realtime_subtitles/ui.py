@@ -160,6 +160,65 @@ def enable_dpi_awareness():
         pass
 
 
+def window_dpi(window):
+    """Read this HWND's effective DPI, not Tk's process-wide screen DPI."""
+    if sys.platform == "win32":
+        try:
+            user = ctypes.windll.user32
+            user.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user.GetAncestor.restype = ctypes.c_void_p
+            user.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+            user.GetDpiForWindow.restype = ctypes.c_uint
+            hwnd = user.GetAncestor(window.winfo_id(), 2)
+            dpi = user.GetDpiForWindow(hwnd)
+            if dpi:
+                return dpi
+        except (AttributeError, OSError):
+            pass
+    return max(96, round(window.winfo_fpixels("1i")))
+
+
+def resize_client_for_dpi(window, width, height):
+    """Correct Tk's system-DPI frame calculation with the current native frame."""
+    if sys.platform != "win32":
+        return
+    from ctypes import wintypes
+
+    user = ctypes.windll.user32
+    user.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    user.GetAncestor.restype = ctypes.c_void_p
+    user.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user.GetWindowLongW.restype = ctypes.c_long
+    user.AdjustWindowRectExForDpi.argtypes = [
+        ctypes.POINTER(wintypes.RECT),
+        ctypes.c_uint,
+        ctypes.c_bool,
+        ctypes.c_uint,
+        ctypes.c_uint,
+    ]
+    user.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    hwnd = user.GetAncestor(window.winfo_id(), 2)
+    rect = wintypes.RECT(0, 0, width, height)
+    if user.AdjustWindowRectExForDpi(
+        ctypes.byref(rect),
+        user.GetWindowLongW(hwnd, -16),
+        False,
+        user.GetWindowLongW(hwnd, -20),
+        window_dpi(window),
+    ):
+        user.SetWindowPos(
+            hwnd, None, 0, 0, rect.right - rect.left, rect.bottom - rect.top, 0x16
+        )  # NOMOVE | NOZORDER | NOACTIVATE
+
+
 class SubtitleApp:
     def __init__(
         self,
@@ -199,7 +258,9 @@ class SubtitleApp:
         self._poll_id = None
         self._save_id = None
         self.diagnostic_window = None
-        self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+        self._last_client_size = None
+        self._dpi_resize_id = None
+        self.scale = window_dpi(root) / 96.0
         root.title("Realtime Subtitles · English / 日本語")
         root.configure(bg=BG)
         root.attributes("-alpha", 1 - self.settings.transparency / 100)
@@ -233,6 +294,7 @@ class SubtitleApp:
                 x = max(left, min(saved_x, left + total_w - width))
                 y = max(top, min(saved_y, top + total_h - height))
         # + followed by a negative coordinate is intentional: Tk absolute screen coordinates.
+        self._initial_client_size = width, height
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def _build_controls(self):
@@ -368,7 +430,7 @@ class SubtitleApp:
         )
         self.error_label.pack(fill="x")
 
-        status = ttk.Frame(self.root, padding=(16, 6))
+        self.status_frame = status = ttk.Frame(self.root, padding=(16, 6))
         status.pack(fill="x")
         self.status_var = tk.StringVar(value="STOPPED")
         ttk.Label(status, textvariable=self.status_var).pack(side="left", padx=(0, 12))
@@ -376,10 +438,15 @@ class SubtitleApp:
         self.level.pack(side="left", padx=(0, 8))
         self.level_text = tk.StringVar()
         ttk.Label(status, textvariable=self.level_text).pack(side="left")
-        self.settings_button = ttk.Button(status, text="設定", command=self.show_settings, width=5)
+        self.settings_button = ttk.Button(
+            status, text="設定", command=self.show_settings, width=5, style="Subtitle.TButton"
+        )
         self.settings_button.pack(side="right")
         self.latest_button = ttk.Button(
-            status, text="最新へ ↑", command=lambda: self.history_text.yview_moveto(0)
+            status,
+            text="最新へ ↑",
+            command=lambda: self.history_text.yview_moveto(0),
+            style="Subtitle.TButton",
         )
         self.latest_button.pack(side="right", padx=(0, 6))
         self.speaker_var = tk.StringVar()
@@ -440,6 +507,9 @@ class SubtitleApp:
     def _build_captions(self):
         self.captions = tk.Frame(self.root, bg=BG)
         self.captions.pack(fill="both", expand=True, padx=24, pady=(8, 16))
+        self._en_logical_size = self.en_size.get()
+        self._ja_logical_size = self.ja_size.get()
+        self.status_font = font.Font(family="Segoe UI", size=-round(12 * self.scale))
         self.en_font = font.Font(
             family="Segoe UI",
             size=-round(self.en_size.get() * self.scale),
@@ -490,19 +560,23 @@ class SubtitleApp:
             selectbackground="#394556",
             takefocus=True,
         )
-        scroll = ttk.Scrollbar(self.history_frame, command=self.history_text.yview)
+        scroll = ttk.Scrollbar(
+            self.history_frame,
+            command=self.history_text.yview,
+            style="Subtitle.Vertical.TScrollbar",
+        )
         self.history_text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.history_text.pack(side="left", fill="both", expand=True)
         self.history_text.tag_configure("ja", font=self.ja_font, foreground="#aeb9cc")
         self.history_text.tag_configure("en", font=self.confirmed_font, spacing3=12)
-        self.history_text.tag_configure("speaker", foreground="#8793a6", font=("Segoe UI", 9))
+        self.history_text.tag_configure("speaker", foreground="#8793a6", font=self.status_font)
         self.captions.bind("<Configure>", lambda _: self._layout_captions())
-        self._layout_captions()
+        self._apply_display_scale()
 
     def _layout_captions(self):
-        width = min(max(1, self.captions.winfo_width()), round(1100 * self.scale))
-        x = max(0, (self.captions.winfo_width() - width) // 2)
+        width = max(1, self.captions.winfo_width())
+        x = 0
         gap = round(4 * self.scale)
         live = self.en_font.metrics("linespace") * 2
         ja = self.ja_font.metrics("linespace") * 2
@@ -827,11 +901,83 @@ class SubtitleApp:
         ja = read_size(self.ja_size, self.ja_font)
         self.en_size.set(en)
         self.ja_size.set(ja)
-        self.en_font.configure(size=-round(en * self.scale), weight=self.en_weight.get())
-        self.ja_font.configure(size=-round(ja * self.scale), weight=self.ja_weight.get())
-        self.confirmed_font.configure(size=-round(en * 0.9 * self.scale))
-        self._layout_captions()
+        self._en_logical_size, self._ja_logical_size = en, ja
+        self._apply_display_scale()
         self._schedule_save()
+
+    def _refresh_dpi(self):
+        if not self.root.winfo_ismapped():
+            return
+        scale = window_dpi(self.root) / 96.0
+        old_scale = self.scale
+        initial = self._last_client_size is None
+        previous_size = self._last_client_size or self._initial_client_size
+        if scale != old_scale:
+            self.scale = scale
+            self._apply_display_scale()
+        if initial or scale != old_scale:
+            # Restore saved client dimensions after mapping on the target monitor;
+            # on moves preserve logical size. Let Windows manage maximized windows.
+            saved_dpi = self.settings.geometry_dpi if self.settings.geometry else 0
+            ratio = (scale * 96 / saved_dpi if saved_dpi else 1) if initial else scale / old_scale
+            size = tuple(round(v * ratio) for v in previous_size)
+            self._last_client_size = size
+            if self.root.state() == "normal":
+                self._resize_for_dpi(*size)
+        elif self._dpi_resize_id is None:
+            self._last_client_size = self.root.winfo_width(), self.root.winfo_height()
+
+    def _resize_for_dpi(self, width, height):
+        if self._dpi_resize_id is not None:
+            self.root.after_cancel(self._dpi_resize_id)
+        minimum = self.root.minsize()
+        width, height = max(width, minimum[0]), max(height, minimum[1])
+        self.root.geometry(f"{width}x{height}")
+
+        def correct_native_frame():
+            self._dpi_resize_id = None
+            if self.closing or self.root.state() != "normal":
+                return
+            resize_client_for_dpi(self.root, width, height)
+            self._last_client_size = width, height
+
+        # Run after Tk applies geometry, so its old frame calculation cannot undo
+        # the correction. No sleep or nested event loop on the Tk thread.
+        self._dpi_resize_id = self.root.after_idle(correct_native_frame)
+
+    def _apply_display_scale(self):
+        # Named fonts/widgets are reused. Do not change global `tk scaling`:
+        # a separate settings window may be on another monitor.
+        self.en_font.configure(
+            size=-round(self._en_logical_size * self.scale), weight=self.en_weight.get()
+        )
+        self.ja_font.configure(
+            size=-round(self._ja_logical_size * self.scale), weight=self.ja_weight.get()
+        )
+        self.confirmed_font.configure(size=-round(self._en_logical_size * 0.9 * self.scale))
+        self.status_font.configure(size=-round(12 * self.scale))
+        style = ttk.Style(self.root)
+        style.configure(
+            "Subtitle.TButton",
+            font=self.status_font,
+            padding=(round(9 * self.scale), round(5 * self.scale)),
+        )
+        style.configure(
+            "Subtitle.Vertical.TScrollbar",
+            width=round(14 * self.scale),
+            arrowsize=round(12 * self.scale),
+        )
+        for widget in self.status_frame.winfo_children():
+            if isinstance(widget, ttk.Label):
+                widget.configure(font=self.status_font)
+        self.status_frame.configure(padding=(round(16 * self.scale), round(6 * self.scale)))
+        self.level.configure(length=round(90 * self.scale))
+        self.progress.configure(length=round(100 * self.scale))
+        self.captions.pack_configure(
+            padx=round(24 * self.scale), pady=(round(8 * self.scale), round(16 * self.scale))
+        )
+        self.history_text.tag_configure("en", spacing3=round(12 * self.scale))
+        self._layout_captions()
 
     def _transparency_changed(self, value):
         transparency = max(0, min(70, round(float(value))))
@@ -841,6 +987,7 @@ class SubtitleApp:
 
     def _configure(self, event):
         if event.widget is self.root:
+            self._refresh_dpi()
             self._schedule_save()
 
     def _schedule_save(self):
@@ -860,6 +1007,7 @@ class SubtitleApp:
             f"{self.root.winfo_width()}x{self.root.winfo_height()}"
             f"{self.root.winfo_x():+d}{self.root.winfo_y():+d}"
         )
+        self.settings.geometry_dpi = round(self.scale * 96)
         try:
             self.settings.english_size = self.en_size.get()
             self.settings.japanese_size = self.ja_size.get()
@@ -1030,7 +1178,9 @@ class SubtitleApp:
                         self.save_result.set(self.local_error)
         except queue.Empty:
             pass
+        self._refresh_dpi()  # Includes initial map and DPI changes without a resize.
         snapshot = self.client.snapshot()
+        snapshot["display"] = {"dpi": round(self.scale * 96), "scale": self.scale}
         is_file = self.source.get() == "audio_file"
         self.status_var.set(
             snapshot.get("playback_state", "Idle") if is_file else snapshot["state"]

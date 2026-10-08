@@ -58,3 +58,12 @@ def test_ruby_layout_migrates_old_ja_size_once(tmp_path):
     assert Settings.load(path).japanese_size == 22
     path.write_text(json.dumps({"subtitle_layout_version": "broken"}))
     assert Settings.load(path).subtitle_layout_version == 2
+
+
+def test_geometry_records_dpi_without_changing_logical_font_size(tmp_path):
+    path = tmp_path / "settings.json"
+    Settings(geometry="1800x900+3300+180", geometry_dpi=240, english_size=20).save(path)
+    saved = Settings.load(path)
+    assert saved.geometry_dpi == 240 and saved.english_size == 20
+    path.write_text('{"geometry_dpi": -1}')
+    assert Settings.load(path).geometry_dpi == 0

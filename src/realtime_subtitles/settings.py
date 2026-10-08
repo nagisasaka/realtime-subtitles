@@ -17,6 +17,7 @@ class Settings:
     audio_file: str = ""
     audio_monitor: bool = False
     geometry: str = ""
+    geometry_dpi: int = 0
     english_size: int = 30
     japanese_size: int = 18
     subtitle_layout_version: int = 2
@@ -38,6 +39,8 @@ class Settings:
             value = data.get(field.name)
             if type(value) is type(getattr(result, field.name)):
                 setattr(result, field.name, value)
+        if not 48 <= result.geometry_dpi <= 768:
+            result.geometry_dpi = 0
         result.english_size = max(8, min(64, result.english_size))
         result.japanese_size = max(8, min(64, result.japanese_size))
         version = data.get("subtitle_layout_version", 1)

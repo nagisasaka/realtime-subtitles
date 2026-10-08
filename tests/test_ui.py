@@ -394,3 +394,78 @@ def complete_revision(history, target, japanese):
         target.unit_id, (ReconstructedParagraph(0, len(target.en_text), japanese),)
     )
     history.reconstructions.update_translation(target.unit_id, "completed", text=japanese)
+
+
+def test_monitor_dpi_updates_pixel_fonts_and_layout_without_recreating_widgets(app, monkeypatch):
+    dpi = [168]
+    monkeypatch.setattr("realtime_subtitles.ui.window_dpi", lambda root: dpi[0])
+    app.en_size.set(20)
+    app.ja_size.set(14)
+    app._font_changed()
+    widgets = dict(app.caption_widgets)
+    history = app.history_text
+    app._refresh_dpi()
+    app.pump()
+    assert app.en_font.cget("size") == -35
+    for value, en, ja in [(240, -50, -35), (168, -35, -24), (240, -50, -35)]:
+        dpi[0] = value
+        app.pump()
+        assert app.scale == value / 96
+        assert app.en_font.cget("size") == en
+        assert app.ja_font.cget("size") == ja
+        assert app.live_text.winfo_height() == app.en_font.metrics("linespace") * 2
+        assert app.live_text.winfo_y() == app.ja_font.metrics("linespace") * 2 + round(
+            4 * app.scale
+        )
+        assert app.live_text.winfo_x() == 0
+        assert app.live_text.winfo_width() == app.captions.winfo_width()
+        assert app.history_frame.winfo_width() == app.captions.winfo_width()
+        assert app.en_size.get() == 20 and app.ja_size.get() == 14
+        assert dict(app.caption_widgets) == widgets and app.history_text is history
+    # Half-written settings must not be normalized/overwritten by a monitor move.
+    app.en_size.set("")
+    dpi[0] = 168
+    app.pump()
+    assert app.en_font.cget("size") == -35
+    assert app.en_size._tk.globalgetvar(app.en_size._name) == ""
+
+
+def test_native_monitor_roundtrip_keeps_logical_geometry(app):
+    import ctypes
+    from ctypes import wintypes
+
+    from realtime_subtitles.ui import window_dpi
+
+    rectangles = []
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HANDLE,
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.LPARAM,
+    )
+
+    def collect(handle, dc, rect, data):
+        rectangles.append((rect.contents.left, rect.contents.top))
+        return True
+
+    callback = callback_type(collect)
+    ctypes.windll.user32.EnumDisplayMonitors(None, None, callback, 0)
+    if len(rectangles) < 2:
+        pytest.skip("Requires two native Windows displays")
+    states = []
+    app.en_size.set(20)
+    app._font_changed()
+    for left, top in [rectangles[0], rectangles[1], rectangles[0]]:
+        app.root.geometry(f"+{left + 100}+{top + 100}")
+        app.pump(0.4)
+        dpi = window_dpi(app.root)
+        assert app.scale == dpi / 96
+        assert app.en_font.cget("size") == -round(20 * dpi / 96)
+        assert app.live_text.winfo_width() == app.captions.winfo_width()
+        states.append((dpi, app.root.winfo_width(), app.root.winfo_height()))
+    for dpi, width, height in states[1:]:
+        assert abs(width / dpi - states[0][1] / states[0][0]) < 0.02
+        assert abs(height / dpi - states[0][2] / states[0][0]) < 0.02
+    app._save_settings()
+    assert app.settings.geometry_dpi == states[-1][0]
