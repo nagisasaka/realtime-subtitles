@@ -74,3 +74,19 @@ context再翻訳はjudge/Codexで別途確認する。
 `benchmark_results/` はGit対象外。固定manifest、raw応答、使用量、全候補prompt、採点、匿名比較表を保持する。
 元音源/GTの配布元は [revdotcom/speech-datasets](https://github.com/revdotcom/speech-datasets/tree/c05ab6fd8b4b627d123c922a22a39e993dd37635/earnings22)、CC-BY-SA 4.0。
 source manifestに記録された版・取得元・ライセンスを維持し、録音やコーパスの本文をGitへ追加しない。
+
+## Windowsで保存結果だけを確認
+
+```powershell
+python -m benchmarks.history_readability.preview `
+  --manifest benchmark_results/history_readability/run1/manifest.json `
+  --a benchmark_results/history_readability/run1/baseline/dev.json `
+  --b benchmark_results/history_readability/run1/candidate3/dev.json `
+  --output benchmark_results/history_readability/run1/windows-preview.json
+```
+
+同じ幅・DPI・フォントのText widgetで各例を8秒ずつ表示し、実Tkのdisplaylinesを保存する。
+原音声の受信速度を再現するプレイヤーではない。棄却draftの比較用表示を含み、本番への適用はしない。
+稼働アプリ・設定・マイク・APIには触れない。`preview.py` はWindows専用。
+
+[2026-10-08の採否](../../docs/history-readability-results.md)：最大3候補を検証し、現行維持。

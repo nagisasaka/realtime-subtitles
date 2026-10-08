@@ -243,3 +243,42 @@ def test_aggregation_accounts_for_missing_and_label_order():
     assert result["readability"]["win"] == 1
     assert result["baseline"]["unnecessary_boundaries"] == 1
     assert result["candidate"]["unnecessary_boundaries"] == 0
+
+
+def test_resume_retains_invocation_and_cached_calls(tmp_path):
+    from benchmarks.history_readability.prepare import read_json, write_json
+    from benchmarks.history_readability.run import execute
+
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "baseline_prompt": "test",
+            "windows": [{"id": "w", "split": "dev", "english": "Yes.", "context": []}],
+        },
+    )
+    args = SimpleNamespace(
+        output=tmp_path,
+        split="dev",
+        ids=None,
+        prompt=None,
+        name="baseline",
+        nonce="",
+        compare=None,
+        reverse=False,
+        seconds=30,
+    )
+    calls = []
+
+    async def run():
+        first = await execute(args, fake_client(calls))
+        assert read_json(first)["status"] == "finished"
+        second = await execute(args, fake_client(calls))
+        assert len(read_json(second)["previous_invocations"]) == 1
+        assert len(calls) == 1
+        args.seconds = -1
+        args.name = "deadline"
+        args.nonce = "new"
+        result = read_json(await execute(args, fake_client(calls)))
+        assert result["status"] == "incomplete" and len(calls) == 1
+
+    asyncio.run(run())

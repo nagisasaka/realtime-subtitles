@@ -23,7 +23,12 @@ async def execute(args, api):
         windows = [w for w in windows if w["id"] in args.ids]
         if len(windows) != len(args.ids):
             raise ValueError("Unknown IDs or split mismatch")
-    prompt = args.prompt.read_text() if args.prompt else manifest["baseline_prompt"]
+    if not windows:
+        raise ValueError("No evaluation windows")
+    baseline = read_json(args.compare) if args.compare else None
+    if baseline and baseline["inputs"]["manifest_hash"] != digest(manifest):
+        raise ValueError("Baseline input mismatch")
+    prompt = args.prompt.read_text(encoding="utf-8") if args.prompt else manifest["baseline_prompt"]
     directory = args.output / args.name
     path = directory / f"{args.split}{('-' + args.nonce) if args.nonce else ''}.json"
     inputs = {
@@ -35,7 +40,8 @@ async def execute(args, api):
         "compare": str(args.compare) if args.compare else None,
         "reverse": args.reverse,
     }
-    if path.exists() and read_json(path)["inputs"] != inputs:
+    previous = read_json(path) if path.exists() else None
+    if previous and previous["inputs"] != inputs:
         raise ValueError("Iteration identity changed; use a new name")
     report = {
         "inputs": inputs,
@@ -44,6 +50,14 @@ async def execute(args, api):
         "results": {},
         "judgments": {},
         "nonce": args.nonce,
+        "previous_invocations": (
+            [
+                *previous.get("previous_invocations", []),
+                {key: previous.get(key) for key in ("started", "ended", "elapsed_sec", "status")},
+            ]
+            if previous
+            else []
+        ),
     }
     started = time.monotonic()
     runner = Runner(args.output, api, seconds=args.seconds)
@@ -83,7 +97,14 @@ async def execute(args, api):
             "A": judge_data(a),
             "B": judge_data(b),
         }
-        call = await runner.call(w["id"] + "-judge", JUDGE_PROMPT, data, Verdict, nonce=args.nonce)
+        try:
+            call = await runner.call(
+                w["id"] + "-judge", JUDGE_PROMPT, data, Verdict, nonce=args.nonce
+            )
+        except Exception as exc:
+            report["judgments"][w["id"]] = {"status": "error", "error": type(exc).__name__}
+            write_json(path, report)
+            return
         grade = {
             "status": call["status"],
             "candidate_label": "A" if swap else "B",
@@ -104,11 +125,16 @@ async def execute(args, api):
     try:
         await asyncio.gather(*(translate(w) for w in windows))
         if args.compare:
-            baseline = read_json(args.compare)
-            if baseline["inputs"]["manifest_hash"] != digest(manifest):
-                raise ValueError("Baseline input mismatch")
             await asyncio.gather(*(judge(w, baseline) for w in windows))
-        report["status"] = "finished"
+        generated = all(
+            r["status"] not in {"deadline", "error", "cancelled"}
+            for r in report["results"].values()
+        )
+        judged = all(
+            g["status"] not in {"deadline", "error", "cancelled", "missing_valid_pair"}
+            for g in report["judgments"].values()
+        )
+        report["status"] = "finished" if generated and judged else "incomplete"
     finally:
         report.update(ended=utc(), elapsed_sec=round(time.monotonic() - started, 3))
         write_json(path, report)

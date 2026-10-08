@@ -126,7 +126,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--anchors", type=Path)
     args = parser.parse_args()
-    rows = [json.loads(line) for line in (args.source / "events.jsonl").open()]
+    rows = [json.loads(line) for line in (args.source / "events.jsonl").open(encoding="utf-8")]
     windows = replay(rows)
     if not args.anchors:
         for w in windows:
