@@ -97,6 +97,7 @@
 - WindowsネイティブPython 3.14.8、Tk 9.0、本番`SubtitleApp`を使用。マイク・API接続は無効化し、一時設定で保存済み実API出力を表示した。
 - 168 DPI（175%）で論理幅1080 / 700を確認。最新が上、各日本語が対応英文の上、Widget再利用、例外なしを実測。狭い表示では結合した英文が4行になる。長い段落は履歴を多く占めるため、これは今後の視認性調整候補。
 - スクリーンショットを目視確認。固定枠と段落内の読順を維持し、幅によるword wrapも確認した。自然さの評価はテキストjudgeであり、画面を使った人間評価ではない。
+- さらに成功済みr6の実API応答を、本番UIへ3 unit順次反映した。初期状態、各raw unit追加、各再翻訳反映、最新位置への復帰の**8画面状態**すべてで最新順・英日表示順・Widget再利用・固定枠・スクロール中の読書位置を確認。`native-tail.json`へ記録した。新たなAPI要求はなく、原音声の受信速度を再現するテストではない。
 - WSL全テスト: **263 passed / 19 skipped**（Windows依存を含むskip）。
 - Windows関連テスト: **104 passed**。履歴更新、原文保持、source range、保存、話者/session境界、逆順表示、スクロール中の読書位置、DPI、partialのWidget再利用を含む。
 - Ruff: pass。本番に追加した指示が実測候補のpromptと文字列で一致することも確認。
@@ -126,6 +127,7 @@ mainのソースとWindows検証用コピーに実装済み。常用のWindows�
 - `reverse_cohesion.tail.json`: 成功した逐次比較と、429で停止したケースを区別して記録。
 - `summary.json`: 集計と、採用案の全窓に対する原文slice一致・被覆検証。
 - `cohesion-native-*.json`, `cohesion-*.png`: Windows描画の実測と画面。
+- `native-tail.json`: 実際に生成済みの逐次再翻訳をWindows UIへ反映した8状態の確認。
 - `ledger.json`, `cache/`, `recovery-probe.json`: 全試行・raw応答・残高不足の診断。
 
 データ・生成物・raw応答はGit除外。APIキーとAuthorization headerは保存していない。

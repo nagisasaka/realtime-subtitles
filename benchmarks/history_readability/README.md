@@ -57,6 +57,20 @@ python -m benchmarks.history_readability.native_preview `
   --screenshot benchmark_results/naturalness/native.png
 ```
 
+逐次更新の保存済み応答も実UIで確認できる。失敗したAPI試行を成功例として再生することは拒否する。
+
+```powershell
+python -m benchmarks.history_readability.native_tail `
+  --manifest benchmark_results/naturalness/manifest.json `
+  --baseline benchmark_results/naturalness/baseline.dev.json `
+  --tail benchmark_results/naturalness/reverse_cohesion.tail.json `
+  --events benchmark_results/naturalness/events.jsonl `
+  --id 4474955-r6 --output benchmark_results/naturalness/native-tail.json
+```
+
+各raw unit追加と再翻訳反映の前後に、最新順・英日表示順・固定枠・Widget再利用・
+過去の段落を読んでいる位置が維持されることを検査する。ライブ受信速度・API性能の試験ではない。
+
 入力ファイルはWSLの無視対象directoryからWindowsの検証用directoryへコピーする。
 `events.jsonl` はmanifestが指す読み取り専用のsourceから取得する。常用アプリへは同期しない。
 API試行時間と、音声受信から字幕までの時間は別物。LLM判定は人間評価の代替指標であり、
