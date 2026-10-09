@@ -6,12 +6,13 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
 from .speaker_policy import UNKNOWN_SPEAKERS
+from .summary_archive import collect_summary_sources
 from .text_translation import MODEL, safe_error
 
 MAX_SUMMARY_CHARS = 60000
@@ -80,6 +81,8 @@ class SummarySnapshot:
     source_count: int
     omitted_count: int
     max_input_chars: int = MAX_SUMMARY_CHARS
+    source_origins: tuple = ()
+    input_logs: tuple = ()
 
     def metadata(self):
         return {
@@ -87,6 +90,8 @@ class SummarySnapshot:
             "source_count": self.source_count,
             "omitted_count": self.omitted_count,
             "max_input_chars": self.max_input_chars,
+            "source_origins": self.source_origins,
+            "input_logs": self.input_logs,
             "speakers": [
                 {k: v for k, v in asdict(s).items() if k != "texts"} for s in self.speakers
             ],
@@ -107,7 +112,7 @@ class SummarySnapshot:
         }
 
 
-def build_snapshot(sources, *, max_chars=MAX_SUMMARY_CHARS):
+def build_snapshot(sources, *, max_chars=MAX_SUMMARY_CHARS, source_origins=(), input_logs=()):
     """Latest bounded confirmed sources, never partials or duplicate reconstructed text.
 
     Keep complete raw segments. Any omitted prefix is explicit in UI and saved metadata.
@@ -153,6 +158,8 @@ def build_snapshot(sources, *, max_chars=MAX_SUMMARY_CHARS):
         len(selected),
         len(sources) - len(selected),
         max_chars,
+        tuple(o for o in source_origins if o["snapshot_source_id"] >= selected[0].segment_id),
+        input_logs,
     )
 
 
@@ -229,7 +236,14 @@ class OpenAILectureAssistant:
 class LectureNotes:
     """One explicitly requested job at a time; never queues work behind live captions."""
 
-    def __init__(self, history, *, assistant_factory=OpenAILectureAssistant, key_provider=None):
+    def __init__(
+        self,
+        history,
+        *,
+        assistant_factory=OpenAILectureAssistant,
+        key_provider=None,
+        log_paths=(),
+    ):
         self.history = history
         self.factory = assistant_factory
         self.key_provider = key_provider or (lambda: os.environ.get("OPENAI_API_KEY", "").strip())
@@ -239,6 +253,15 @@ class LectureNotes:
         self.summary = self.questions = None
         self.error = ""
         self.operation = ""
+        self.log_paths = tuple(dict.fromkeys(str(p) for p in log_paths))
+
+    def set_log_paths(self, paths):
+        with self._lock:
+            if self.active or self._stop.is_set():
+                return False
+            self.log_paths = tuple(dict.fromkeys(str(p) for p in paths))
+            self.error = ""
+            return True
 
     @property
     def active(self):
@@ -264,11 +287,11 @@ class LectureNotes:
                 self.error = "OPENAI_API_KEY が未設定です。"
                 return False
             if kind == "summary":
-                try:
-                    snapshot = build_snapshot(self.history.sources())
-                except ValueError:
-                    self.error = "要約できる確定英文がありません（入力上限は60,000文字）。"
+                sources = tuple(self.history.sources())
+                if not sources and not self.log_paths:
+                    self.error = "要約できる確定英文がありません。"
                     return False
+                snapshot = sources, self.log_paths, datetime.now(UTC).isoformat()
                 summary = None
             else:
                 snapshot, summary = None, self.summary
@@ -290,10 +313,22 @@ class LectureNotes:
 
     def _run(self, kind, key, snapshot, summary):
         try:
+            if kind == "summary":
+                sources, logs, captured_at = snapshot
+                sources, origins, logs = collect_summary_sources(
+                    sources,
+                    logs,
+                    cancelled=self._stop.is_set,
+                )
+                snapshot = build_snapshot(sources, source_origins=origins, input_logs=logs)
+                # Time of the live-history snapshot, before asynchronous file/network work.
+                snapshot = replace(snapshot, created_at=captured_at)
             asyncio.run(self._generate(kind, key, snapshot, summary))
         except Exception as exc:
+            if self._stop.is_set():
+                return
             with self._lock:
-                self.error = "生成に失敗しました: " + safe_error(exc)
+                self.error = "生成／ログ読込に失敗しました: " + safe_error(exc)
             self.history.record_analysis(
                 {
                     "kind": "lecture_analysis_error",

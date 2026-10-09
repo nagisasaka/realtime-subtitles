@@ -238,7 +238,6 @@ class SubtitleApp:
     ):
         self.root = root
         self.client = client if client is not None else LiveClient()
-        self.lecture_notes = LectureNotes(self.client.history)
         self.summary_window = None
         self.autosave = TranscriptAutosave({"subtitles": self.client.history})
         self._render_key = None
@@ -260,6 +259,7 @@ class SubtitleApp:
         self._animation_clock = time.monotonic
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
+        self.lecture_notes = LectureNotes(self.client.history, log_paths=self.settings.summary_logs)
         if audio_file is not None:
             self.settings.input_source, self.settings.audio_file = "audio_file", audio_file
         self.device_loader = device_loader
@@ -1382,8 +1382,16 @@ class SubtitleApp:
         if self.summary_window is None or not self.summary_window.window.winfo_exists():
             from .summary_ui import SummaryWindow
 
-            self.summary_window = SummaryWindow(self.root, self.lecture_notes)
+            self.summary_window = SummaryWindow(
+                self.root,
+                self.lecture_notes,
+                on_logs_changed=self._summary_logs_changed,
+            )
         self.summary_window.show()
+
+    def _summary_logs_changed(self):
+        self.settings.summary_logs = list(self.lecture_notes.log_paths)
+        self._schedule_save()
 
     def show_diagnostics(self):
         if self.diagnostic_window and self.diagnostic_window.winfo_exists():

@@ -2,15 +2,17 @@
 
 import tkinter as tk
 from datetime import datetime
-from tkinter import font, ttk
+from pathlib import Path
+from tkinter import filedialog, font, ttk
 
 
 class SummaryWindow:
-    def __init__(self, root, notes):
+    def __init__(self, root, notes, *, on_logs_changed=lambda: None):
         # UI loads this dialog lazily; reuse the native frame/DPI helpers.
         from .ui import BG, style_window_frame, window_dpi
 
         self.notes = notes
+        self.on_logs_changed = on_logs_changed
         self.window = window = tk.Toplevel(root)
         window.withdraw()
         window.title("話者別の要約・講演への質問")
@@ -46,12 +48,35 @@ class SummaryWindow:
         )
         self.status_label.pack(side="left", fill="x", expand=True)
         self.scope = tk.StringVar(
-            window, value="「再生成」で、今回の起動後の確定字幕を要約します。"
+            window, value="「再生成」で、引き継ぎログと今回の確定字幕を要約します。"
         )
         self.scope_label = ttk.Label(
             self.panel, textvariable=self.scope, style="Summary.TLabel", wraplength=700
         )
         self.scope_label.pack(fill="x")
+        self.log_controls = ttk.Frame(self.panel)
+        self.log_controls.pack(fill="x")
+        self.add_log_button = ttk.Button(
+            self.log_controls,
+            text="ログを追加…",
+            command=self.add_logs,
+            style="Summary.TButton",
+        )
+        self.add_log_button.pack(side="left")
+        self.clear_log_button = ttk.Button(
+            self.log_controls,
+            text="引継ぎ解除",
+            command=self.clear_logs,
+            style="Summary.TButton",
+        )
+        self.clear_log_button.pack(side="left")
+        self.log_info = tk.StringVar(window)
+        self.log_label = ttk.Label(
+            self.log_controls,
+            textvariable=self.log_info,
+            style="Summary.TLabel",
+        )
+        self.log_label.pack(side="left", fill="x", expand=True)
         self.notebook = ttk.Notebook(self.panel, style="Summary.TNotebook")
         self.notebook.pack(fill="both", expand=True)
         self.texts = []
@@ -105,6 +130,22 @@ class SummaryWindow:
         self.notes.generate_questions()
         self.refresh()
 
+    def add_logs(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.window,
+            title="要約へ引き継ぐ字幕JSONLを選択",
+            initialdir=str(Path.home() / "RealtimeSubtitles" / "Autosave"),
+            filetypes=[("字幕ログ", "*.jsonl")],
+        )
+        if paths and self.notes.set_log_paths((*self.notes.log_paths, *paths)):
+            self.on_logs_changed()
+            self.refresh()
+
+    def clear_logs(self):
+        if self.notes.set_log_paths(()):
+            self.on_logs_changed()
+            self.refresh()
+
     def _apply_scale(self):
         scale = self.scale
         self.body_font.configure(size=-round(16 * scale))
@@ -144,6 +185,8 @@ class SummaryWindow:
         self.panel.configure(padding=round(16 * scale))
         self.questions_button.pack_configure(padx=round(8 * scale))
         self.scope_label.pack_configure(pady=round(12 * scale))
+        self.log_controls.pack_configure(pady=(0, round(12 * scale)))
+        self.clear_log_button.pack_configure(padx=round(8 * scale))
         self.note.pack_configure(pady=(round(10 * scale), 0))
         for text in self.texts:
             text.configure(padx=round(12 * scale), pady=round(10 * scale))
@@ -188,6 +231,11 @@ class SummaryWindow:
         active, operation, error, summary, questions = self.notes.snapshot()
         self.regenerate_button.configure(state="disabled" if active else "normal")
         self.questions_button.configure(state="disabled" if active or not summary else "normal")
+        self.add_log_button.configure(state="disabled" if active else "normal")
+        self.clear_log_button.configure(
+            state="disabled" if active or not self.notes.log_paths else "normal"
+        )
+        self.log_info.set(f"次回の要約：引継ぎ {len(self.notes.log_paths)}ログ ＋ 今回の字幕")
         self.status.set(
             ("要約を生成中…" if operation == "summary" else "質問を生成中…") if active else error
         )
@@ -199,6 +247,7 @@ class SummaryWindow:
             omitted = summary["snapshot"]["omitted_count"]
             self.scope.set(
                 f"{stamp:%m/%d %H:%M:%S} 時点の確定字幕 {summary['snapshot']['source_count']}区間"
+                + f" · 引継ぎ{len(summary['snapshot']['input_logs'])}ログを含む"
                 + (f"（上限60,000文字：先頭の{omitted}区間は対象外）" if omitted else "")
             )
             self.notebook.select(0)

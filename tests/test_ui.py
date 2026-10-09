@@ -86,6 +86,27 @@ def test_summary_dialog_has_independent_monitor_dpi(app, monkeypatch):
     assert not app.lecture_notes.active
 
 
+def test_summary_log_selection_is_persisted_without_generating(app, monkeypatch, tmp_path):
+    from realtime_subtitles.settings import Settings
+
+    app.show_summary()
+    dialog = app.summary_window
+    path = tmp_path / "previous.jsonl"
+    monkeypatch.setattr("tkinter.filedialog.askopenfilenames", lambda **_: (str(path),))
+    dialog.add_log_button.invoke()
+    app.pump()
+    assert app.lecture_notes.log_paths == (str(path),)
+    assert "1ログ" in dialog.log_info.get()
+    assert not app.lecture_notes.active and app.lecture_notes.summary is None
+    app._save_settings()
+    assert Settings.load(app.settings_file).summary_logs == [str(path)]
+    dialog.clear_log_button.invoke()
+    app.pump()
+    app._save_settings()
+    assert Settings.load(app.settings_file).summary_logs == []
+    assert not app.lecture_notes.active
+
+
 @pytest.fixture
 def app(tmp_path):
     import tkinter as tk

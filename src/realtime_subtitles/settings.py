@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 
@@ -29,6 +29,7 @@ class Settings:
     live_japanese_weight: str = "normal"
     transparency: int = 25
     always_on_top: bool = True
+    summary_logs: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path=None):
@@ -39,10 +40,10 @@ class Settings:
         result = cls()
         if not isinstance(data, dict):
             return result
-        for field in fields(cls):
-            value = data.get(field.name)
-            if type(value) is type(getattr(result, field.name)):
-                setattr(result, field.name, value)
+        for item in fields(cls):
+            value = data.get(item.name)
+            if type(value) is type(getattr(result, item.name)):
+                setattr(result, item.name, value)
         if not 48 <= result.geometry_dpi <= 768:
             result.geometry_dpi = 0
         result.english_size = max(8, min(64, result.english_size))
@@ -79,6 +80,9 @@ class Settings:
                 setattr(result, name, "bold" if name == "live_english_weight" else "normal")
         if result.input_source not in {"microphone", "audio_file"}:
             result.input_source = "microphone"
+        result.summary_logs = list(
+            dict.fromkeys(p for p in result.summary_logs if isinstance(p, str) and p.strip())
+        )
         if not re.fullmatch(r"\d{3,5}x\d{3,5}[+-]\d{1,6}[+-]\d{1,6}", result.geometry):
             result.geometry = ""
         return result
