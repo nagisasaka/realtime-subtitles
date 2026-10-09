@@ -44,3 +44,16 @@
 保存済み文字起こしだけを使い、Speechmatics・マイクは起動しない。計測する時間は分割＋履歴翻訳APIの待ち時間であり、音声から字幕までの実時間遅延ではない。
 
 API出力、judge、生データは無視対象の`benchmark_results/history_readability/naturalness_20261008/`に保存する。スクリプト・テスト・計画と結果報告をGit管理する。稼働中のアプリは停止しない。表示確認はWindows側の独立した検証環境を使う。
+
+## 追加の音声分野による確認（ユーザー指定、2026-10-09）
+
+決算説明会だけへの過適合を確認するため、採用候補`reverse_cohesion`と旧baselineの指示・judge基準を固定したまま、次も比較する。
+
+- 既存の6分技術講演WAVと対応するLinden 1のraw log: 製品名、構成要素、細切れの原因説明の3窓。
+- NOTSOFAR-1 `dev_set/240825.1_dev1`の遠距離マイク: `MTG_30884`（雑音high・whiteboard）、`MTG_30861`（whiteboard）、`MTG_30862`（overlaps）の各1窓。タグは会議全体のmetadataであり、各抜粋で雑音を測定したという意味ではない。
+- 音源SHA-256を元のASR実行manifest/reportと照合する。既存raw ASRを再利用し、原文は補正しない。今回は再翻訳の確認であり、WERやASRの再評価ではない。
+- 技術講演の旧ログは受信時刻とEOSを記録していない。完了reportとfinal件数を照合してローカルでflushし、記録のないreceive timeは`null`とする。音声時刻を受信時刻として代用しない。
+- 6窓・対象原文70.08秒を出力取得前に固定。技術講演の3番目は初期選定案から224秒以降へ変更したが、API実行前であり、初期案も`pre_api_selection_draft.json`に残す。
+- 追加結果を見てpromptを調整しない。追加枠は最大48試行、先行177試行との合計上限225で、元の240試行枠内。生成・評価・順序反転をこの枠で行う。
+
+再現用は`benchmarks.history_readability.cross_audio`。結果は`benchmark_results/history_readability/cross_audio_20261009/`へ独立保存する。

@@ -68,10 +68,16 @@ def replay(rows):
         elif kind == "EndOfTranscript":
             assembler.flush("eos")
             ended.add(identity)
-    windows = []
-    for identity, history in histories.items():
+    for identity in histories:
         if identity not in ended:
             raise ValueError(f"Missing EOS: {identity[0]}")
+    return windows_for_histories(histories)
+
+
+def windows_for_histories(histories):
+    """Project replayed production histories; no timestamps inferred here."""
+    windows = []
+    for identity, history in histories.items():
         entries = history.reconstructions.entries()
         # Final coverage groups only; intermediate 2-unit versions stay diagnostic.
         for revision in entries:

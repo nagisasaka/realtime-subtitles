@@ -6,6 +6,26 @@
 Astraによる匿名判定を使う。最初の5案と、結果を踏まえた追加案を区別して保存する。
 [7案の結果・採否・残課題](../../docs/history-naturalness-results.md)を参照。
 
+追加の技術講演・会議音声の確認は、採用済み候補を変えずに行う。以下は元WAVと既存Lindenログのhashを照合し、6窓を固定する。WAVを再送するASR比較ではない。
+
+```bash
+.venv/bin/python -m benchmarks.history_readability.cross_audio \
+  --parent benchmark_results/history_readability/naturalness_20261008 \
+  --output benchmark_results/history_readability/cross_audio_20261009 \
+  --technical-audio /mnt/c/workspace/realtime-subtitles/diagnostics/agent-migration/comparison-6min.wav \
+  --technical-logs /mnt/c/workspace/realtime-subtitles/diagnostics/agent-migration/ab-6min \
+  --meeting-audio testdata/external/notsofar1 \
+  --meeting-logs /workspace/jimaku-notsofar-benchmark/benchmark_results/notsofar1/20261007_combined
+.venv/bin/python -m benchmarks.history_readability.naturalness \
+  --output benchmark_results/history_readability/cross_audio_20261009 \
+  --variant baseline --split holdout
+.venv/bin/python -m benchmarks.history_readability.naturalness \
+  --output benchmark_results/history_readability/cross_audio_20261009 \
+  --variant reverse_cohesion --split holdout
+```
+
+`cross_audio`は保存済み親manifestの旧指示を引き継ぐため、現在のmain指示を誤ってbaselineにしない。追加枠は48試行以内かつ親の残り枠以下。旧講演ログにない受信時刻/EOSは捏造せず、受信時間を使う遅延評価から除外する。確定原文・speaker/audio timestampは維持する。会議ログでは実際のEOSを必須にする。
+
 ```bash
 .venv/bin/python -m benchmarks.history_readability.naturalness \
   --output benchmark_results/history_readability/naturalness_20261008 \
