@@ -401,6 +401,60 @@ def complete_revision(history, target, japanese):
     history.reconstructions.update_translation(target.unit_id, "completed", text=japanese)
 
 
+def test_surface_cleanup_renders_without_losing_raw_offsets_or_live_frame(app):
+    from realtime_subtitles.history_english import JoinCleanup, apply_join_cleanup
+    from realtime_subtitles.history_reconstruction import (
+        BatchTranslation,
+        EnglishSplit,
+        pair_translations,
+        split_english,
+    )
+
+    h = app.client.history
+    units = []
+    for i in range(30):
+        value = "We need," if i == 14 else "More capacity." if i == 15 else f"Sentence {i}."
+        units.append(make_unit(h, event(value, i), "s"))
+    target = h.reconstructions.plan(units[15])
+    h.set_partial("Live unchanged", "S1")
+    app.pump()
+    widget = app.history_text
+    widget.yview("pair_15_en")
+    app.pump()
+    y, height = app.live_text.winfo_y(), app.root.winfo_height()
+    chunks, rejected = apply_join_cleanup(
+        target.en_text,
+        split_english(target.en_text, EnglishSplit(end_tokens=[3])),
+        [JoinCleanup(start_token=2, remove_previous_punctuation=True, lowercase_initial=True)],
+        (2,),
+    )
+    assert not rejected
+    h.reconstructions.set_chunks(target.unit_id, chunks)
+    h.reconstructions.set_paragraphs(
+        target.unit_id,
+        pair_translations(
+            chunks,
+            BatchTranslation(translations=[{"id": 0, "ja": "もっと容量が必要です。"}]),
+        ),
+    )
+    h.reconstructions.update_translation(target.unit_id, "completed", text="もっと容量が必要です。")
+    app.pump()
+    content = widget.get("1.0", "end")
+    assert "もっと容量が必要です。\nWe need more capacity.\n" in content
+    assert "We need," not in content and "More capacity." not in content
+    assert h.segments()[14].en_text == "We need,"
+    assert h.segments()[15].en_text == "More capacity."
+    assert "capacity" in widget.get("@0,0", "@0,0 + 150 chars")
+    for identity in (14, 15):
+        for mark, offset, length in app._history_english_runs[identity]:
+            assert widget.get(mark, f"{mark}+{length}c").lower() == (
+                h.segments()[identity].en_text[offset : offset + length].lower()
+            )
+    assert app.live_text.cget("text") == "Live unchanged"
+    assert app.history_text is widget
+    assert (app.live_text.winfo_y(), app.root.winfo_height()) == (y, height)
+
+
 @pytest.mark.parametrize("coalesced", [False, True])
 def test_retranslated_paragraphs_always_render_newest_first(app, coalesced):
     from realtime_subtitles.history_reconstruction import ReconstructedParagraph

@@ -933,16 +933,18 @@ class SubtitleApp:
         # Reverse whole EN/JA pairs, never the text inside a paragraph.
         display_blocks = tuple(reversed(blocks))
         for block in display_blocks:
+            english = block.display_en_text
             speaker = f"↳ {block.speaker or ''}\n" if block.break_before else ""
             ja = (block.ja_text or "") + "\n"
             offsets.append(
                 (size(rendered), size(rendered + speaker), size(rendered + speaker + ja))
             )
-            chunks.extend((speaker, "speaker", ja, "ja", block.en_text + "\n", "en"))
-            rendered += speaker + ja + block.en_text + "\n"
+            chunks.extend((speaker, "speaker", ja, "ja", english + "\n", "en"))
+            rendered += speaker + ja + english + "\n"
         text.insert(position, *chunks)
         for block, (start, ja, en) in zip(display_blocks, offsets, strict=True):
-            end = en + size(block.en_text + "\n")
+            english = block.display_en_text
+            end = en + size(english + "\n")
             for suffix, offset in [("start", start), ("ja", ja), ("en", en), ("end", end)]:
                 mark = f"block_{block.key}_{suffix}"
                 text.mark_set(mark, f"{position}+{offset}c")
@@ -953,9 +955,9 @@ class SubtitleApp:
             ):
                 original = self.client.history._segments[identity].en_text.strip()
                 mark = f"block_{block.key}_run_{j}"
-                text.mark_set(mark, f"{position}+{en + size(block.en_text[:block_begin])}c")
+                text.mark_set(mark, f"{position}+{en + size(english[:block_begin])}c")
                 text.mark_gravity(mark, "right")
-                local, length = size(original[:begin]), size(block.en_text[block_begin:block_end])
+                local, length = size(original[:begin]), size(english[block_begin:block_end])
                 runs.append((identity, mark, local, length))
                 self._history_english_runs.setdefault(identity, []).append((mark, local, length))
                 self._history_group_for_unit[identity] = revision.revision_id

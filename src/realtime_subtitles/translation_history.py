@@ -374,7 +374,7 @@ class TranslationHistory:
             parts.append(
                 f"[{block.key} source units {block.start}–{block.end} / "
                 f"{first.start_ms}–{last.end_ms} ms (unit bounds) / {first.session_id}]\n"
-                f"EN: {block.en_text}\n"
+                f"EN: {block.display_en_text}\n"
                 f"JA: {block.ja_text or '[' + block.translation_status + ']'}\n"
             )
         included = {i for s in units for i in s.source_segment_ids}
