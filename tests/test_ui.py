@@ -41,7 +41,7 @@ def test_summary_dialog_is_manual_and_keeps_live_captions_responsive(app):
     assert dialog.regenerate_button.instate(["disabled"])
     app.client.history.set_partial("Still updating English", "UU")
     app.pump()
-    assert "Still updating English" in app.live_text.cget("text").replace("\n", " ")
+    assert "Still updating English" in app.live_text.get("1.0", "end-1c").replace("\n", " ")
     assert app.speaker_var.get() == "S1"
     dialog.window.withdraw()
     app.show_summary()
@@ -107,6 +107,88 @@ def test_summary_log_selection_is_persisted_without_generating(app, monkeypatch,
     assert not app.lecture_notes.active
 
 
+def test_copy_selection_all_and_context_menu_in_all_three_windows(app):
+    from test_lecture_summary import FakeAssistant
+
+    h = app.client.history
+    for i in range(3):
+        u = make_unit(h, event(f"Confirmed English sentence {i}.", start=i), "s")
+        h.update_translation(u.unit_id, "completed", text=f"日本語訳{i}です。")
+    app.local_error = "入力エラーの詳細をコピーできます。"
+    app.show_settings()
+    app.show_summary()
+    notes, dialog = app.lecture_notes, app.summary_window
+    notes.factory = FakeAssistant()
+    notes.key_provider = lambda: "test-key"
+    dialog.regenerate_button.invoke()
+    for _ in range(40):
+        app.pump(0.05)
+        if not notes.active:
+            break
+    notes.error = "要約の根拠IDが、対象話者の発話と一致していません。"
+    app.pump()
+    try:
+        original_clipboard = app.root.clipboard_get()
+    except Exception:
+        original_clipboard = None
+    try:
+        widgets = [
+            app.live_text,
+            app.ja_text,
+            app.history_text,
+            app.error_label,
+            app.autosave_text,
+            dialog.texts[0],
+            dialog.status_label,
+        ]
+        for widget in widgets:
+            expected = widget.get("1.0", "end-1c")
+            assert expected
+            widget.winfo_toplevel().lift()
+            widget.focus_force()
+            widget.update()
+            widget.event_generate("<Control-a>")
+            widget.event_generate("<Control-c>")
+            assert widget.clipboard_get() == expected
+            widget.tag_remove("sel", "1.0", "end")
+            widget.tag_add("sel", "1.0", "1.0+4c")
+            widget.event_generate("<<Copy>>")
+            assert widget.clipboard_get() == widget.get("1.0", "1.0+4c")
+            widget.copy_menu.invoke(2)  # Whole text, not only the selected four characters.
+            assert widget.clipboard_get() == expected
+            widget.event_generate("<<Paste>>")
+            widget.event_generate("<BackSpace>")
+            assert widget.get("1.0", "end-1c") == expected
+            assert widget.cget("state") == "disabled"
+        app.settings_window.withdraw()
+        app.live_text.event_generate("<Button-3>", x=10, y=10)
+        app.live_text.copy_menu.unpost()
+        assert app.settings_window.state() == "withdrawn"
+    finally:
+        app.root.clipboard_clear()
+        if original_clipboard is not None:
+            app.root.clipboard_append(original_clipboard)
+
+
+def test_live_selection_survives_partial_growth_without_dragging_window(app):
+    h = app.client.history
+    h.set_partial("Stable prefix and a growing")
+    app.pump()
+    widget = app.live_text
+    widget.tag_add("sel", "1.0", "1.6")
+    position = app.root.winfo_x(), app.root.winfo_y()
+    h.set_partial("Stable prefix and a growing English sentence.")
+    app.pump()
+    assert widget.get("sel.first", "sel.last") == "Stable"
+    assert widget.get("1.0", "end-1c").endswith("sentence.")
+    widget.event_generate("<ButtonPress-1>", x=8, y=8)
+    widget.event_generate("<B1-Motion>", x=80, y=8)
+    widget.event_generate("<ButtonRelease-1>", x=80, y=8)
+    app.pump()
+    assert (app.root.winfo_x(), app.root.winfo_y()) == position
+    assert widget.tag_ranges("sel")
+
+
 @pytest.fixture
 def app(tmp_path):
     import tkinter as tk
@@ -158,10 +240,10 @@ def test_fixed_widgets_coalescing_partial_correction_long_lines(app):
     app.pump()
     assert app._render_count - previous <= 2
     assert (
-        app.live_text.cget("text").replace("\n", " ")
+        app.live_text.get("1.0", "end-1c").replace("\n", " ")
         == "I think the biggest problem is reliability in production"
     )
-    assert "incorrect" not in app.live_text.cget("text")
+    assert "incorrect" not in app.live_text.get("1.0", "end-1c")
     app.client.history.set_partial("Very long live statement with many words. " * 100)
     u = make_unit(
         app.client.history, event("A long confirmed statement with many words. " * 100), "s"
@@ -170,13 +252,13 @@ def test_fixed_widgets_coalescing_partial_correction_long_lines(app):
     app.pump()
     assert dict(app.caption_widgets) == widgets
     for key, w in widgets.items():
-        assert len(w.cget("text").splitlines()) <= 2
+        assert len(w.get("1.0", "end-1c").splitlines()) <= 2
         assert (w.winfo_y(), w.winfo_height()) == bounds[key]
-        assert w.winfo_class() == "Label"  # no Text scroll buffer
+        assert w.winfo_class() == "Text" and w.cget("state") == "disabled"
     assert app.root.winfo_height() == height
     app.client.history.clear_display()
     app.pump()
-    assert all(not w.cget("text") for w in widgets.values())
+    assert all(not w.get("1.0", "end-1c") for w in widgets.values())
     assert app.client.history.sources()
 
 
@@ -249,7 +331,7 @@ def test_save_remains_nonmodal_and_late_ja_does_not_replace_current(app, tmp_pat
     second = make_unit(h, event("Current answer.", 2, "S2"), "s")
     h.update_translation(second.unit_id, "completed", text="現在の回答。")
     app.pump()
-    assert app.ja_text.cget("text") == "現在の回答。"
+    assert app.ja_text.get("1.0", "end-1c") == "現在の回答。"
     release = threading.Event()
     original = h.save
 
@@ -268,10 +350,10 @@ def test_save_remains_nonmodal_and_late_ja_does_not_replace_current(app, tmp_pat
         h.update_translation(first.unit_id, "completed", text="過去の質問。")
         h.set_partial("New live words")
         app.pump()
-        assert app.ja_text.cget("text") == ""
+        assert app.ja_text.get("1.0", "end-1c") == ""
         assert "現在の回答。" in app.history_text.get("1.0", "end")
         assert "過去の質問。" in app.history_text.get("1.0", "end")
-        assert app.live_text.cget("text") == "New live words"
+        assert app.live_text.get("1.0", "end-1c") == "New live words"
         release.set()
         deadline = time.monotonic() + 3
         while app.saving and time.monotonic() < deadline:
@@ -292,7 +374,7 @@ def test_reverse_history_ruby_late_ja_scroll_anchor_and_live_hold(app):
     for i in range(30):
         units.append(make_unit(h, event(f"Sentence number {i}.", i), "s"))
     app.pump()
-    assert app.live_text.cget("text") == "Sentence number 29."
+    assert app.live_text.get("1.0", "end-1c") == "Sentence number 29."
     text = app.history_text
     content = text.get("1.0", "end")
     assert content.index("number 28") < content.index("number 27")
@@ -301,10 +383,10 @@ def test_reverse_history_ruby_late_ja_scroll_anchor_and_live_hold(app):
     h.update_translation(29, "completed", text="29番の文。")
     app.pump()
     assert app.ja_text.winfo_y() < app.live_text.winfo_y()
-    assert app.ja_text.cget("text") == "29番の文。"
+    assert app.ja_text.get("1.0", "end-1c") == "29番の文。"
     h.set_partial("New speech", "S2")
     app.pump()
-    assert not app.ja_text.cget("text")
+    assert not app.ja_text.get("1.0", "end-1c")
     assert "29番の文。\nSentence number 29." in text.get("1.0", "end")
     text.yview("pair_15_start")
     app.pump()
@@ -365,14 +447,16 @@ def test_final_pair_is_held_live_and_moves_as_a_whole_on_next_partial(app):
     assembler.clock = lambda: now[0]
     assembler.accept(h.record_segment(event("One complete sentence.", 0), "s"))
     app.pump()
-    assert app.live_text.cget("text") == "One complete sentence."
+    assert app.live_text.get("1.0", "end-1c") == "One complete sentence."
     assert not app.history_text.get("1.0", "end").strip()
     now[0] += 3600
     app.pump()
-    assert not h.segments() and app.live_text.cget("text") == "One complete sentence."
+    assert not h.segments() and app.live_text.get("1.0", "end-1c") == "One complete sentence."
     h.set_partial("And another", "S1")
     app.pump()
-    assert "One complete sentence. And another" == app.live_text.cget("text").replace("\n", " ")
+    assert "One complete sentence. And another" == app.live_text.get("1.0", "end-1c").replace(
+        "\n", " "
+    )
     assembler.accept(h.record_segment(event("And another.", 2), "s"))
     h.set_partial("")
     app.pump()
@@ -381,11 +465,13 @@ def test_final_pair_is_held_live_and_moves_as_a_whole_on_next_partial(app):
     h.update_translation(0, "completed", text="完結した文と、もう一文。")
     now[0] += 3600
     app.pump()
-    assert app.ja_text.cget("text") == "完結した文と、もう一文。"
+    assert app.ja_text.get("1.0", "end-1c") == "完結した文と、もう一文。"
     assert not app.history_text.get("1.0", "end").strip()
     h.set_partial("Next pair", "S1")
     app.pump()
-    assert app.live_text.cget("text") == "Next pair" and not app.ja_text.cget("text")
+    assert app.live_text.get("1.0", "end-1c") == "Next pair" and not app.ja_text.get(
+        "1.0", "end-1c"
+    )
     assert "完結した文と、もう一文。\nOne complete sentence. And another." in app.history_text.get(
         "1.0", "end"
     )
@@ -398,7 +484,7 @@ def test_llm_revision_waits_for_archive_and_replaces_pairs_without_late_overwrit
     target = h.reconstructions.plan(last)
     complete_revision(h, target, "状況は急速に変化しています。")
     app.pump()
-    assert app.live_text.cget("text") == "changing rapidly."
+    assert app.live_text.get("1.0", "end-1c") == "changing rapidly."
     assert not app._history_group_for_unit
     h.set_partial("Another live statement")
     app.pump()
@@ -543,7 +629,7 @@ def test_surface_cleanup_renders_without_losing_raw_offsets_or_live_frame(app):
             assert widget.get(mark, f"{mark}+{length}c").lower() == (
                 h.segments()[identity].en_text[offset : offset + length].lower()
             )
-    assert app.live_text.cget("text") == "Live unchanged"
+    assert app.live_text.get("1.0", "end-1c") == "Live unchanged"
     assert app.history_text is widget
     assert (app.live_text.winfo_y(), app.root.winfo_height()) == (y, height)
 
@@ -798,7 +884,7 @@ def test_tail_replacement_keeps_prefix_widget_anchor_and_live_frame(app):
     assert "当社の新しい基盤。\nWith our new platform 🚀." in text
     assert widget.get(prefix_mark, f"{prefix_mark} lineend") == before
     assert app.history_text is widget and app.live_text.winfo_y() == y
-    assert app.live_text.cget("text") == "Next live partial"
+    assert app.live_text.get("1.0", "end-1c") == "Next live partial"
     h.update_translation(u.unit_id, "completed", text="古い単独訳")
     app.pump()
     assert "古い単独訳" not in widget.get("1.0", "end")
@@ -815,8 +901,8 @@ def test_latest_wrap_keeps_a_blank_line_above_history(app):
         unit = make_unit(h, event(text, 2), "s")
         h.update_translation(unit.unit_id, "completed", text="現在の日本語字幕です。" * 30)
         app.pump()
-        assert len(app.live_text.cget("text").splitlines()) == expected_lines
-        assert len(app.ja_text.cget("text").splitlines()) == 2
+        assert len(app.live_text.get("1.0", "end-1c").splitlines()) == expected_lines
+        assert len(app.ja_text.get("1.0", "end-1c").splitlines()) == 2
         assert app.history_frame.winfo_y() == history_y
         bottom = app.live_text.winfo_y() + app.live_text.winfo_height()
         assert app.history_frame.winfo_y() - bottom == app.en_font.metrics("linespace")

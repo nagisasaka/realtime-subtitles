@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font, ttk
 
+from .text_copy import ReadOnlyText, install_copy_tree
+
 
 class SummaryWindow:
     def __init__(self, root, notes, *, on_logs_changed=lambda: None):
@@ -43,15 +45,25 @@ class SummaryWindow:
         )
         self.questions_button.pack(side="left")
         self.status = tk.StringVar(window)
-        self.status_label = ttk.Label(
-            self.controls, textvariable=self.status, style="Summary.TLabel"
+        self.status_label = ReadOnlyText(
+            self.controls,
+            textvariable=self.status,
+            auto_height=True,
+            bg=BG,
+            fg="#bec6d3",
+            font=self.control_font,
         )
         self.status_label.pack(side="left", fill="x", expand=True)
         self.scope = tk.StringVar(
             window, value="「再生成」で、引き継ぎログと今回の確定字幕を要約します。"
         )
-        self.scope_label = ttk.Label(
-            self.panel, textvariable=self.scope, style="Summary.TLabel", wraplength=700
+        self.scope_label = ReadOnlyText(
+            self.panel,
+            textvariable=self.scope,
+            auto_height=True,
+            bg=BG,
+            fg="#bec6d3",
+            font=self.control_font,
         )
         self.scope_label.pack(fill="x")
         self.log_controls = ttk.Frame(self.panel)
@@ -71,10 +83,13 @@ class SummaryWindow:
         )
         self.clear_log_button.pack(side="left")
         self.log_info = tk.StringVar(window)
-        self.log_label = ttk.Label(
+        self.log_label = ReadOnlyText(
             self.log_controls,
             textvariable=self.log_info,
-            style="Summary.TLabel",
+            bg=BG,
+            fg="#bec6d3",
+            font=self.control_font,
+            auto_height=True,
         )
         self.log_label.pack(side="left", fill="x", expand=True)
         self.notebook = ttk.Notebook(self.panel, style="Summary.TNotebook")
@@ -83,7 +98,7 @@ class SummaryWindow:
         for label in ("話者別の要約", "質問案"):
             frame = ttk.Frame(self.notebook)
             self.notebook.add(frame, text=label)
-            text = tk.Text(
+            text = ReadOnlyText(
                 frame,
                 bg=BG,
                 fg="#edf0f5",
@@ -103,11 +118,13 @@ class SummaryWindow:
             text.pack(fill="both", expand=True)
             text.tag_configure("speaker", font=self.heading_font, foreground="#a6c8ed")
             self.texts.append(text)
-        self.note = ttk.Label(
+        self.note = ReadOnlyText(
             self.panel,
-            style="Summary.TLabel",
+            bg=BG,
+            fg="#bec6d3",
+            font=self.control_font,
+            auto_height=True,
             text="話者不明の区間は直前話者に暫定割当。結果は字幕と一緒に自動保存します。",
-            wraplength=700,
         )
         self.note.pack(side="bottom", fill="x", before=self.notebook)
         self._summary_id = self._questions_id = None
@@ -115,6 +132,7 @@ class SummaryWindow:
         self._client_size = round(780 * self.scale), round(620 * self.scale)
         x, y = root.winfo_rootx() + 30, root.winfo_rooty() + 30
         window.geometry(f"{self._client_size[0]}x{self._client_size[1]}+{x}+{y}")
+        install_copy_tree(window)
 
     def show(self):
         self.window.deiconify()
@@ -226,8 +244,6 @@ class SummaryWindow:
                 self._apply_scale()
                 resize_client_for_dpi(window, width, height)
             self._client_size = window.winfo_width(), window.winfo_height()
-            for label in (self.scope_label, self.note, self.status_label):
-                label.configure(wraplength=max(150, window.winfo_width() - round(40 * scale)))
         active, operation, error, summary, questions = self.notes.snapshot()
         self.regenerate_button.configure(state="disabled" if active else "normal")
         self.questions_button.configure(state="disabled" if active or not summary else "normal")

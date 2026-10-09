@@ -22,6 +22,7 @@ from .live_client import LiveClient
 from .realtime_api import State
 from .settings import Settings
 from .subtitle_view import blend_color, changed_history_ranges, translation_caption, wrap_subtitle
+from .text_copy import ReadOnlyText, install_copy, install_copy_tree
 
 BG = "#111318"
 HISTORY_FLASH_COLOR = "#344b65"
@@ -362,8 +363,12 @@ class SubtitleApp:
             command=self._schedule_save,
         )
         self.file_info = tk.StringVar()
-        self.file_info_label = ttk.Label(
-            self.settings_window, textvariable=self.file_info, wraplength=640
+        self.file_info_label = ReadOnlyText(
+            self.settings_window,
+            textvariable=self.file_info,
+            auto_height=True,
+            bg=BG,
+            fg="#bec6d3",
         )
 
         options = ttk.Frame(self.settings_window, padding=12)
@@ -440,23 +445,32 @@ class SubtitleApp:
         ).pack(side="left", fill="x", expand=True)
         details = ttk.Frame(self.settings_window, padding=12)
         details.pack(fill="x")
-        ttk.Label(
+        ReadOnlyText(
             details,
             text="最新の英日字幕は上部に固定。下の履歴は新しい順に並び、スクロールで読み返せます。",
-            wraplength=640,
-        ).pack(anchor="w")
-        ttk.Label(details, text=f"自動保存先: {self.autosave.directory}", wraplength=600).pack(
-            anchor="w"
+            auto_height=True,
+            bg=BG,
+            fg="#bec6d3",
+        ).pack(fill="x")
+        self.autosave_text = ReadOnlyText(
+            details,
+            text=f"自動保存先: {self.autosave.directory}",
+            auto_height=True,
+            bg=BG,
+            fg="#bec6d3",
         )
+        self.autosave_text.pack(fill="x")
         ttk.Button(details, text="未翻訳を再試行", command=self.client.retry_translations).pack(
             anchor="e"
         )
         ttk.Button(details, text="Diagnostics", command=self.show_diagnostics).pack(anchor="e")
         self.transcript_status = tk.StringVar()
-        ttk.Label(details, textvariable=self.transcript_status).pack(anchor="w")
+        ReadOnlyText(
+            details, textvariable=self.transcript_status, auto_height=True, bg=BG, fg="#bec6d3"
+        ).pack(fill="x")
         self.error_var = tk.StringVar()
-        self.error_label = ttk.Label(
-            details, textvariable=self.error_var, foreground="#ffb4a9", wraplength=640
+        self.error_label = ReadOnlyText(
+            details, textvariable=self.error_var, auto_height=True, bg=BG, fg="#ffb4a9"
         )
         self.error_label.pack(fill="x")
 
@@ -492,6 +506,8 @@ class SubtitleApp:
                 widget.bind("<B1-Motion>", self._drag_move)
 
         self._init_settings_dpi()
+        install_copy_tree(self.settings_window)
+        install_copy_tree(status)
 
     def _init_settings_dpi(self):
         self.settings_scale = None
@@ -675,20 +691,18 @@ class SubtitleApp:
             ("ja", self.live_ja_font, "#aeb9cc"),
             ("live", self.en_font, "#ffffff"),
         ]:
-            widget = tk.Label(
+            widget = ReadOnlyText(
                 self.captions,
                 bg=BG,
                 fg=color,
                 font=face,
-                anchor="nw",
-                justify="left",
+                wrap="none",
                 bd=0,
                 padx=0,
                 pady=0,
             )
             self.caption_widgets[name] = widget
-            widget.bind("<ButtonPress-1>", self._drag_start)
-            widget.bind("<B1-Motion>", self._drag_move)
+            widget.bind("<MouseWheel>", lambda _: "break")
         self.live_text = self.caption_widgets["live"]
         self.ja_text = self.caption_widgets["ja"]
         self.history_frame = tk.Frame(self.captions, bg=BG)
@@ -700,7 +714,7 @@ class SubtitleApp:
             highlightthickness=0,
             wrap="word",
             state="disabled",
-            cursor="arrow",
+            cursor="xterm",
             padx=0,
             pady=0,
             font=self.confirmed_font,
@@ -713,6 +727,7 @@ class SubtitleApp:
             style="Subtitle.Vertical.TScrollbar",
         )
         self.history_text.configure(yscrollcommand=scroll.set)
+        install_copy(self.history_text)
         scroll.pack(side="right", fill="y")
         self.history_text.pack(side="left", fill="both", expand=True)
         self.history_text.tag_configure("ja", font=self.ja_font, foreground="#aeb9cc")
@@ -1061,8 +1076,8 @@ class SubtitleApp:
             if self._caption_layout.get(widget) == layout_key:
                 continue
             rendered = wrap_subtitle(value, face.measure, width, lines)
-            if widget.cget("text") != rendered:
-                widget.configure(text=rendered)
+            widget.set_text(rendered)
+            widget.yview_moveto(0)
             self._caption_layout[widget] = layout_key
         self.speaker_var.set(("↳ " if view.speaker_changed else "") + (view.speaker or ""))
 
@@ -1401,7 +1416,7 @@ class SubtitleApp:
         self.diagnostic_window.title("Diagnostics")
         style_window_frame(self.diagnostic_window)
         self.diagnostic_window.geometry("720x400")
-        self.diagnostic_text = tk.Text(
+        self.diagnostic_text = ReadOnlyText(
             self.diagnostic_window,
             bg=BG,
             fg="#e5e7eb",
@@ -1533,10 +1548,7 @@ class SubtitleApp:
         if self.diagnostic_window and self.diagnostic_window.winfo_exists():
             diagnostic = json.dumps(snapshot, ensure_ascii=False, indent=2)
             if diagnostic != self._last_diagnostic:
-                self.diagnostic_text.configure(state="normal")
-                self.diagnostic_text.delete("1.0", "end")
-                self.diagnostic_text.insert("1.0", diagnostic)
-                self.diagnostic_text.configure(state="disabled")
+                self.diagnostic_text.set_text(diagnostic)
                 self._last_diagnostic = diagnostic
         if (
             self.closing

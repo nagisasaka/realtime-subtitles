@@ -149,7 +149,7 @@ $env:OPENAI_API_KEY=[Environment]::GetEnvironmentVariable("OPENAI_API_KEY", "Use
 .\.venv-win\Scripts\pythonw.exe -m realtime_subtitles
 ```
 
-画面の **設定 → Start** で開始します。設定画面は右クリック、または `Ctrl+,` でも開けます。
+画面の **設定 → Start** で開始します。設定画面は字幕の余白で右クリック、または `Ctrl+,` でも開けます。
 PowerShellスクリプトが許可された環境では `scripts\run-windows.ps1` も使えます。
 スクリプト実行ポリシーでブロックされる場合は、上記のPython直接起動を使用してください。
 
@@ -241,6 +241,10 @@ WindowsのWF-1000XM6出力で、3秒でStop→同じWAVを12秒再StartしてEOF
 - Click-throughは設定からON/OFF。**Ctrl+Alt+F10**で解除して設定画面を開けます。起動時はOFF。
 - Clearと次のStartでは最新枠と表示履歴をクリア。内部履歴とJSONL/TXT自動保存は維持します。
 - エラー詳細、翻訳queue、API情報、自動保存先は設定／Diagnosticsへまとめています。
+- 最新字幕・履歴・要約／質問・設定のエラー文や保存先は、ドラッグ選択して **Ctrl+C** でコピーできます。
+  **Ctrl+A** はその欄の全文選択。右クリックでは「コピー」「すべて選択」「全文をコピー」を選べます。
+  通常の設定ラベルも右クリックで全文コピーできます。表示内容は編集されません。
+  字幕ウィンドウの移動は上部のステータスバーまたはタイトルバーをドラッグしてください。
 
 ### 話者別の要約・講演への質問
 
@@ -270,6 +274,8 @@ raw話者ラベル・原文・元のsession IDを維持し、ライブ字幕・�
 既存の`OPENAI_API_KEY`と`gpt-6-luna / reasoning.effort=none`を利用し、ボタン操作ごとに追加のテキストAPI料金が発生します。
 [OpenAI公式のStructured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses)
 で話者別データを取得し、返却された話者・根拠source IDをローカルで検証します。ASRの誤りや要約内容の正確性を保証するものではありません。
+正しい根拠IDが5件を超えても要約を破棄しません。空の本文・話者の不一致・不正な根拠IDなどは具体的な理由を表示し、
+失敗した段階・理由コードをJSONLへ記録します。失敗時は前回成功した要約を保持します。
 生成結果・対象source ID・話者の暫定割当件数・使用量・処理時間は既存JSONLへ追記し、最新要約とそれに対応する質問はTXTにも保存します。
 失敗はこのウィンドウ内に表示し、字幕・録音・翻訳を止めません。閉じて開き直すと生成済み結果を再表示します。
 2026-10-09にWindowsネイティブGUIから過去2ログ＋現在の字幕、計1,517区間で実APIを確認しました。

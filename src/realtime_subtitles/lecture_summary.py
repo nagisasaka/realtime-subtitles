@@ -9,7 +9,7 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .speaker_policy import UNKNOWN_SPEAKERS
 from .summary_archive import collect_summary_sources
@@ -28,7 +28,7 @@ silently correct doubtful ASR or invent missing content. Write a concise, cohere
 (2-5 sentences per speaker, fewer if little was said), avoiding fragment-by-fragment repetition.
 Speaker groups are provisional: unknown labels may inherit the preceding speaker; do not infer
 real names, roles or identities.
-Return exactly one entry per supplied speaker_key, with 1-5 supporting source_segment_ids
+Return exactly one entry per supplied speaker_key, with a few supporting source_segment_ids
 belonging to that speaker. If nothing meaningful is recoverable, say so, without guessing.
 """
 
@@ -65,6 +65,14 @@ class SpeakerQuestions(BaseModel):
 
 class LectureQuestions(BaseModel):
     speakers: list[SpeakerQuestions]
+
+
+class AnalysisValidationError(ValueError):
+    """Local, safe diagnostic text; never include arbitrary API exception messages."""
+
+    def __init__(self, code, message, **details):
+        super().__init__(message)
+        self.code, self.message, self.details = code, message, details
 
 
 @dataclass(frozen=True)
@@ -133,7 +141,9 @@ def build_snapshot(sources, *, max_chars=MAX_SUMMARY_CHARS, source_origins=(), i
         selected.append(source)
         size += cost
     if not selected:
-        raise ValueError("No confirmed sources fit the summary limit")
+        raise AnalysisValidationError(
+            "empty_input", "要約できる確定英文がありません（入力上限60,000文字）。"
+        )
     selected.reverse()
     # Summary-only continuity: same labels across imported logs share a group. Unknown
     # turns inherit the preceding known label, even across restarts or the input cutoff.
@@ -177,26 +187,45 @@ def validate_summary(result, snapshot):
     expected = {s.key: set(s.source_segment_ids) for s in snapshot.speakers}
     keys = [s.speaker_key for s in result.speakers]
     if len(keys) != len(expected) or set(keys) != set(expected):
-        raise ValueError("Missing, duplicated or unknown speaker")
-    for speaker in result.speakers:
-        if (
-            not speaker.summary.strip()
-            or not 1 <= len(speaker.source_segment_ids) <= 5
-            or not set(speaker.source_segment_ids) <= expected[speaker.speaker_key]
-        ):
-            raise ValueError("Empty summary or invalid source attribution")
+        raise AnalysisValidationError(
+            "speaker_mapping",
+            "要約の話者が不足・重複、または入力の話者と一致していません。",
+            expected_count=len(expected),
+            received_count=len(keys),
+        )
+    for index, speaker in enumerate(result.speakers):
+        if not speaker.summary.strip():
+            raise AnalysisValidationError(
+                "empty_summary", "APIから空の要約が返りました。", speaker_index=index
+            )
+        if not speaker.source_segment_ids:
+            raise AnalysisValidationError(
+                "missing_sources", "要約の根拠となる発話IDがありません。", speaker_index=index
+            )
+        invalid = set(speaker.source_segment_ids) - expected[speaker.speaker_key]
+        if invalid:
+            raise AnalysisValidationError(
+                "invalid_sources",
+                "要約の根拠IDが、対象話者の発話と一致していません。",
+                speaker_index=index,
+                invalid_source_ids=sorted(invalid)[:20],
+            )
+        # More than five valid citations are harmless. Never discard a whole summary
+        # merely because the model supplied extra, correctly attributed evidence.
 
 
 def validate_questions(result, summary):
     expected = {s["speaker_key"] for s in summary["output"]["speakers"]}
     keys = [s.speaker_key for s in result.speakers]
     if len(keys) != len(expected) or set(keys) != expected:
-        raise ValueError("Invalid question speaker mapping")
+        raise AnalysisValidationError(
+            "question_speakers", "質問案の話者が、生成済み要約の話者と一致していません。"
+        )
     for speaker in result.speakers:
         if len(speaker.questions) > 3 or any(
             not q.ja.strip() or not q.en.strip() for q in speaker.questions
         ):
-            raise ValueError("Invalid question output")
+            raise AnalysisValidationError("invalid_questions", "質問案の件数または本文が不正です。")
 
 
 def render_analysis(record):
@@ -226,17 +255,24 @@ class OpenAILectureAssistant:
         self.client = AsyncOpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)
 
     async def generate(self, kind, payload):
-        response = await self.client.responses.parse(
-            model=MODEL,
-            reasoning={"effort": "none"},
-            instructions=(SUMMARY_INSTRUCTIONS if kind == "summary" else QUESTION_INSTRUCTIONS),
-            input=json.dumps(payload, ensure_ascii=False),
-            text_format=LectureSummary if kind == "summary" else LectureQuestions,
-            max_output_tokens=8000,
-            store=False,
-        )
+        try:
+            response = await self.client.responses.parse(
+                model=MODEL,
+                reasoning={"effort": "none"},
+                instructions=(SUMMARY_INSTRUCTIONS if kind == "summary" else QUESTION_INSTRUCTIONS),
+                input=json.dumps(payload, ensure_ascii=False),
+                text_format=LectureSummary if kind == "summary" else LectureQuestions,
+                max_output_tokens=8000,
+                store=False,
+            )
+        except ValidationError:
+            raise AnalysisValidationError(
+                "response_format", "API応答の形式を読み取れませんでした。再生成してください。"
+            ) from None
         if response.status != "completed" or response.output_parsed is None:
-            raise ValueError("Incomplete or refused lecture analysis")
+            raise AnalysisValidationError(
+                "incomplete_response", "APIの生成が完了しなかったか、応答が拒否されました。"
+            )
         return response.output_parsed, response.usage.model_dump() if response.usage else None
 
     async def close(self):
@@ -322,6 +358,7 @@ class LectureNotes:
         self._stop.set()
 
     def _run(self, kind, key, snapshot, summary):
+        stage = "ログ読込" if kind == "summary" else "質問生成"
         try:
             if kind == "summary":
                 sources, logs, captured_at = snapshot
@@ -333,17 +370,24 @@ class LectureNotes:
                 snapshot = build_snapshot(sources, source_origins=origins, input_logs=logs)
                 # Time of the live-history snapshot, before asynchronous file/network work.
                 snapshot = replace(snapshot, created_at=captured_at)
+            stage = "要約生成" if kind == "summary" else "質問生成"
             asyncio.run(self._generate(kind, key, snapshot, summary))
         except Exception as exc:
             if self._stop.is_set():
                 return
+            validation = isinstance(exc, AnalysisValidationError)
+            detail = exc.message if validation else safe_error(exc)
             with self._lock:
-                self.error = "生成／ログ読込に失敗しました: " + safe_error(exc)
+                self.error = f"{stage}に失敗しました: {detail}"
             self.history.record_analysis(
                 {
                     "kind": "lecture_analysis_error",
                     "operation": kind,
                     "error": safe_error(exc),
+                    "stage": stage,
+                    "reason_code": exc.code if validation else type(exc).__name__,
+                    "detail": detail,
+                    "validation_details": exc.details if validation else {},
                     "generated_at": datetime.now(UTC).isoformat(),
                 }
             )

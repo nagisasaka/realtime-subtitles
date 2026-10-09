@@ -8,6 +8,7 @@ import pytest
 
 from realtime_subtitles.autosave import TranscriptAutosave
 from realtime_subtitles.lecture_summary import (
+    AnalysisValidationError,
     LectureNotes,
     LectureQuestions,
     LectureSummary,
@@ -276,6 +277,53 @@ def test_response_attribution_validation(fault):
         data[0]["summary"] = " "
     with pytest.raises(ValueError):
         validate_summary(LectureSummary.model_validate({"speakers": data}), snapshot)
+
+
+def test_more_than_five_valid_citations_does_not_discard_the_summary():
+    h = TranslationHistory()
+    for i in range(12):
+        source(h, f"Confirmed statement {i}.")
+    snapshot = build_snapshot(h.sources())
+    result = LectureSummary.model_validate(
+        {
+            "speakers": [
+                {
+                    "speaker_key": snapshot.speakers[0].key,
+                    "summary": "複数の観点から信頼性について説明しています。",
+                    "source_segment_ids": list(range(12)),
+                }
+            ]
+        }
+    )
+    validate_summary(result, snapshot)
+    assert result.speakers[0].source_segment_ids == list(range(12))
+
+
+def test_invalid_citation_has_actionable_message_and_saved_reason_without_losing_old_summary():
+    h, fake, notes = harness()
+    notes.regenerate()
+    wait(notes)
+    previous = notes.summary
+    generate = fake.generate
+
+    async def invalid(kind, payload):
+        result, usage = await generate(kind, payload)
+        result.speakers[0].source_segment_ids = [999]
+        return result, usage
+
+    fake.generate = invalid
+    assert notes.regenerate()
+    wait(notes)
+    assert notes.summary is previous
+    assert "根拠ID" in notes.error and "話者" in notes.error
+    record = h.autosave_updates(0)[0][-1]
+    assert record["kind"] == "lecture_analysis_error"
+    assert record["stage"] == "要約生成" and record["reason_code"] == "invalid_sources"
+    assert record["validation_details"]["invalid_source_ids"] == [999]
+    assert "test-key" not in json.dumps(record)
+    with pytest.raises(AnalysisValidationError) as error:
+        validate_summary(LectureSummary(speakers=[]), build_snapshot(h.sources()))
+    assert error.value.code == "speaker_mapping"
 
 
 def test_question_response_rejects_unknown_speaker():
