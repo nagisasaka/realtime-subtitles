@@ -56,7 +56,13 @@ class FakeAssistant:
                         {
                             "speaker_key": s["speaker_key"],
                             "summary": "信頼性について説明しています。",
-                            "source_segment_ids": [s["sources"][0]["source_segment_id"]],
+                            "source_segment_ids": [
+                                next(
+                                    turn["source_segment_id"]
+                                    for turn in payload["conversation"]
+                                    if turn["speaker_key"] == s["speaker_key"]
+                                )
+                            ],
                         }
                         for s in payload["speakers"]
                     ]
@@ -95,26 +101,60 @@ def harness():
     return history, fake, notes
 
 
-def test_snapshot_keeps_raw_sources_separates_sessions_and_unconfirmed():
+def test_snapshot_combines_sessions_preserving_raw_sources_and_excluding_partials():
     h = TranslationHistory()
     source(h, "Unidentified beginning.", "UU")
     source(h, "The system must be reliable.")
     source(h, "And fast.", "UU")
     source(h, "A second view.", "S2")
-    source(h, "Another person with the same label.", "S1", "two")
+    source(h, "Resuming with the same label.", "S1", "two")
     h.set_partial("Do not summarize this unfinished partial")
     before = [asdict(s) for s in h.sources()]
     h.clear_display()
     snapshot = build_snapshot(h.sources())
-    assert len(snapshot.speakers) == 4
-    unknown, s1, s2, restarted_s1 = snapshot.speakers
+    assert len(snapshot.speakers) == 3
+    unknown, s1, s2 = snapshot.speakers
     assert unknown.speaker is None
-    assert s1.texts == ("The system must be reliable.", "And fast.")
+    assert s1.texts == (
+        "The system must be reliable.",
+        "And fast.",
+        "Resuming with the same label.",
+    )
     assert s1.inherited_count == 1
-    assert restarted_s1.key != s1.key and restarted_s1.session_id != s1.session_id
+    assert s1.session_ids == ("one", "two") and s2.session_ids == ("one",)
+    assert [s.label for s in snapshot.speakers] == ["話者不明", "S1", "S2"]
+    payload = snapshot.payload()
+    assert [t["source_segment_id"] for t in payload["conversation"]] == list(range(5))
+    assert [t["speaker_key"] for t in payload["conversation"]] == [
+        unknown.key,
+        s1.key,
+        s1.key,
+        s2.key,
+        s1.key,
+    ]
+    assert [t["text"] for t in payload["conversation"]] == [s.en_text for s in h.sources()]
+    assert "session" not in json.dumps(payload)
     assert "unfinished partial" not in json.dumps(snapshot.payload())
     assert [asdict(s) for s in h.sources()] == before
     assert snapshot.metadata()["source_count"] == 5
+    assert snapshot.metadata()["conversation_scope"] == "continuous"
+
+
+def test_summary_inherits_unknown_across_restart_and_input_cutoff_without_changing_live():
+    h = TranslationHistory()
+    source(h, "Earlier identified speech.", "S2", "one")
+    source(h, "Resumed speech.", "UU", "two")
+    source(h, "Still speaking.", None, "two")
+    before = [asdict(s) for s in h.sources()]
+    snapshot = build_snapshot(h.sources(), max_chars=32)
+    assert snapshot.omitted_count == 1
+    assert len(snapshot.speakers) == 1
+    group = snapshot.speakers[0]
+    assert group.label == "S2" and group.inherited_count == 2
+    assert group.texts == ("Resumed speech.", "Still speaking.")
+    assert group.session_ids == ("two",)
+    assert [asdict(s) for s in h.sources()] == before
+    assert h.sources()[1].effective_speaker == "UU"
 
 
 def test_summary_input_bound_is_explicit_and_only_omits_whole_prefix():
