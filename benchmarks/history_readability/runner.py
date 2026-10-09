@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import asdict
@@ -121,6 +122,11 @@ class Runner:
                 )
             except (Exception, asyncio.CancelledError) as exc:
                 result.update(status="error", error=safe_error(exc))
+                code = getattr(exc, "code", None)
+                if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,80}", code):
+                    # Keep the machine code for quota/rate-limit diagnosis, not the
+                    # exception message, response headers, or credential-bearing body.
+                    result["error_code"] = code
                 if isinstance(exc, asyncio.CancelledError):
                     result["status"] = "cancelled"
             result["latency_ms"] = round((self.clock() - started) * 1000, 2)

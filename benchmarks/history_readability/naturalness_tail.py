@@ -16,7 +16,7 @@ from .runner import Runner, client
 from .tail_review import add_saved_unit, apply_result, seed, source_histories
 
 
-async def arm(runner, source_units, window, initial, following, prompts):
+async def arm(runner, source_units, window, initial, following, prompts, *, nonce=""):
     history = TranslationHistory()
     for unit in source_units[: window["unit_ids"][-1] + 1]:
         add_saved_unit(history, unit)
@@ -42,6 +42,7 @@ async def arm(runner, source_units, window, initial, following, prompts):
             job,
             prompts["split"],
             translation_prompt=prompts["translation"],
+            nonce=nonce,
             protected_prefix_chars=history.reconstructions.protected_prefix_for(target.unit_id),
         )
         apply_result(history, target, result)
@@ -77,7 +78,7 @@ async def arm(runner, source_units, window, initial, following, prompts):
     }, history
 
 
-async def execute(directory, variant, ids, api, variant_file=None):
+async def execute(directory, variant, ids, api, variant_file=None, nonce=""):
     manifest = read_json(directory / "manifest.json")
     config = variant_config(manifest, variant, variant_file)
     for name, sha in manifest["source_hashes"].items():
@@ -96,8 +97,10 @@ async def execute(directory, variant, ids, api, variant_file=None):
         "ids": ids,
         "following_units": 3,
         "variant_config": config,
+        "nonce": nonce,
     }
-    path = directory / f"{variant}.tail.json"
+    suffix = "." + nonce if nonce else ""
+    path = directory / f"{variant}.tail{suffix}.json"
     if path.exists() and read_json(path)["identity"] != identity:
         raise ValueError("Prior trial identity differs")
     report = {"identity": identity, "cases": {}, "status": "running"}
@@ -120,10 +123,11 @@ async def execute(directory, variant, ids, api, variant_file=None):
                     initial,
                     following,
                     manifest["variants"]["baseline"] if name == "baseline" else config,
+                    nonce=nonce,
                 )
                 case[name] = result
-                history.save(directory / f"{variant}.tail.{w['id']}.{name}.jsonl")
-                history.save(directory / f"{variant}.tail.{w['id']}.{name}.txt")
+                history.save(directory / f"{variant}.tail{suffix}.{w['id']}.{name}.jsonl")
+                history.save(directory / f"{variant}.tail{suffix}.{w['id']}.{name}.txt")
                 write_json(path, report)
             if any(case[k]["status"] != "valid" for k in ("baseline", variant)):
                 case["judgment"] = {"status": "not_both_valid"}
@@ -141,6 +145,7 @@ async def execute(directory, variant, ids, api, variant_file=None):
                 manifest["judge_prompt"],
                 data,
                 ReaderVerdict,
+                nonce=nonce,
                 **manifest["judge"],
             )
             case["judgment"] = {
@@ -170,6 +175,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--variant", required=True)
     parser.add_argument("--variant-file", type=Path)
+    parser.add_argument("--nonce", default="")
     parser.add_argument("--ids", nargs="+", required=True)
     args = parser.parse_args()
     lock = args.output / "runner.lock"
@@ -179,7 +185,11 @@ def main():
 
         async def run():
             async with client() as api:
-                print(await execute(args.output, args.variant, args.ids, api, args.variant_file))
+                print(
+                    await execute(
+                        args.output, args.variant, args.ids, api, args.variant_file, args.nonce
+                    )
+                )
 
         asyncio.run(run())
     finally:

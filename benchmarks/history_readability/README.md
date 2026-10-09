@@ -4,6 +4,7 @@
 
 新しい[比較計画](../../docs/history-naturalness-plan.md)では、固定入力・Luna生成・
 Astraによる匿名判定を使う。最初の5案と、結果を踏まえた追加案を区別して保存する。
+[7案の結果・採否・残課題](../../docs/history-naturalness-results.md)を参照。
 
 ```bash
 .venv/bin/python -m benchmarks.history_readability.naturalness \
@@ -37,6 +38,9 @@ JSONには `id`、`parent_manifest_hash`、`config: {title, split, translation}`
 同一の確定履歴を起点に、両案それぞれ3 unitを順次追加する。
 元の英文と再翻訳対象外の段落が維持されることを検査し、最後の履歴を匿名採点する。
 JSONL/TXT出力も保存する。Speechmatics、マイク、音声再生は使用しない。
+一時的な通信失敗後に再生成する場合は `--nonce recovery2` を付ける。
+これは有料API要求を増やす操作であり、残高不足時に自動で繰り返さない。
+失敗の機械判読用codeだけを保存し、例外の本文やHTTP headerは保存しない。
 
 Windowsでは `native_preview` が本番の `SubtitleApp` を使って保存済み出力を描画する。
 独立した一時設定を使い、`start` 自体を無効化するため、音声/API接続は開始しない。

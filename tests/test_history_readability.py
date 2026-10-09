@@ -130,6 +130,24 @@ def test_deadline_no_new_api_and_failure_saved(tmp_path):
     asyncio.run(run())
 
 
+def test_error_code_kept_without_raw_error_body_or_header(tmp_path):
+    class QuotaError(Exception):
+        code = "rate_limit_exceeded"
+        status_code = 429
+        body = {"secret": "must not persist"}
+
+    async def parse(**kwargs):
+        raise QuotaError("private request detail")
+
+    async def run():
+        r = Runner(tmp_path, SimpleNamespace(responses=SimpleNamespace(parse=parse)))
+        result = await r.call("probe", "test", {}, EnglishSplit)
+        assert result["error_code"] == "rate_limit_exceeded"
+        assert "private" not in str(result) and "secret" not in str(result)
+
+    asyncio.run(run())
+
+
 def test_judge_coverage_is_not_silently_counted_as_zero():
     empty = {
         "boundaries": [],
