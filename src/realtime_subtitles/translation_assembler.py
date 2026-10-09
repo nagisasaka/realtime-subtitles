@@ -35,7 +35,7 @@ class TranslationUnitAssembler:
                 previous = self.pending[-1]
                 if session_id != previous.session_id:
                     self._flush("session_boundary")
-                elif speaker not in UNKNOWN_SPEAKERS and speaker != previous.speaker:
+                elif speaker not in UNKNOWN_SPEAKERS and speaker != previous.effective_speaker:
                     self._flush("speaker_boundary")
 
     def accept(self, source):
@@ -45,7 +45,7 @@ class TranslationUnitAssembler:
                 same = (
                     source.session_id is not None
                     and source.session_id == previous.session_id
-                    and same_speaker_group(source.speaker, previous.speaker)
+                    and same_speaker_group(source.effective_speaker, previous.effective_speaker)
                     and not source.break_before
                 )
                 if not same:

@@ -87,7 +87,6 @@ def test_even_complete_sentences_wait_for_second_final(text):
     [
         {"speaker": "S2"},
         {"session": "b"},
-        {"speaker": "UU"},
     ],
 )
 def test_boundaries_prevent_join(kwargs):
@@ -143,8 +142,8 @@ def test_unknown_run_does_not_bridge_known_speakers_or_partials():
     a.note_speaker("S2", "a")
     feed("Other speaker.", 4, 5, speaker="S2")
     feed("Continues.", 5, 6, speaker="S2")
-    assert [u.source_segment_ids for u in h.segments()] == [(0,), (1, 2), (3,), (4, 5)]
-    assert [u.speaker for u in h.segments()] == ["S1", "UU", "UU", "S2"]
+    assert [u.source_segment_ids for u in h.segments()] == [(0, 1), (2, 3), (4, 5)]
+    assert [u.speaker for u in h.segments()] == ["S1", "S1", "S2"]
     assert h.segments()[-1].break_before
 
 
@@ -154,6 +153,53 @@ def test_unknown_speaker_run_flushes_at_session_boundary():
     feed("New session.", 1, 2, speaker="UU", session="b")
     a.flush("eos")
     assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]
+
+
+@pytest.mark.parametrize("unknown", ["UU", "SU", None, ""])
+def test_unknown_inherits_confirmed_speaker_without_mutating_raw(unknown):
+    _, h, a, feed = harness()
+    feed("You.")
+    raw = feed("Know, we.", 1, 2, speaker=unknown)
+    feed("Just.", 2, 3)
+    a.note_speaker("S1", "a")
+    feed("Heard.", 3, 4, speaker=unknown)
+    assert [u.source_segment_ids for u in h.segments()] == [(0, 1), (2, 3)]
+    assert all(u.speaker == "S1" and not u.break_before for u in h.segments())
+    assert raw.speaker == unknown and raw.grouping_speaker == "S1"
+    assert json.loads(raw.raw_event_json)["segment"]["speaker"] == unknown
+    rows, _ = h.autosave_updates(0)
+    stored = [r for r in rows if r["kind"] == "raw_source_segment"][1]
+    assert stored["speaker"] == unknown and stored["grouping_speaker"] == "S1"
+    assert h.reconstructions.plan(h.segments()[-1]) is not None
+
+
+def test_carry_forward_resets_on_new_session_and_ignores_provisional_partials():
+    _, h, a, feed = harness()
+    feed("Known speaker.")
+    h.set_partial("Possibly another", "S2")
+    raw = feed("Still unknown.", 1, 2, speaker="UU")
+    assert raw.grouping_speaker == "S1"
+    h.begin_session("new", {"input_source": "microphone"})
+    h.set_partial("Unknown live", "UU")
+    assert h.subtitle_view().speaker is None
+    raw = feed("New unknown.", speaker="UU", session="new")
+    assert raw.grouping_speaker == "UU"
+    assert h.subtitle_view().speaker is None
+    a.flush()
+    assert h.segments()[-1].speaker == "UU"
+
+
+def test_known_partial_does_not_flush_unknown_carried_from_same_speaker():
+    _, h, a, feed = harness()
+    feed("First.")
+    feed("Second.", 1, 2)
+    feed("Unknown held.", 2, 3, speaker="UU")
+    a.note_speaker("S1", "a")
+    h.set_partial("Continuation", "UU")
+    assert len(a.pending) == 1 and h.subtitle_view().speaker == "S1"
+    assert not h.subtitle_view().speaker_changed
+    a.note_speaker("S2", "a")
+    assert not a.pending and h.segments()[-1].speaker == "S1"
 
 
 def test_punctuation_and_long_audio_gap_do_not_split_pairs():

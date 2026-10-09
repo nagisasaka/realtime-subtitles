@@ -21,6 +21,71 @@ def event(text, start=0, speaker="S1"):
     }
 
 
+def test_summary_dialog_is_manual_and_keeps_live_captions_responsive(app):
+    from test_lecture_summary import FakeAssistant, source
+
+    notes = app.lecture_notes
+    fake = FakeAssistant()
+    notes.factory = fake
+    notes.key_provider = lambda: "test-key"
+    source(app.client.history, "Reliability matters.")
+    app.summary_button.invoke()
+    app.pump()
+    dialog = app.summary_window
+    assert dialog.window.winfo_viewable()
+    assert not fake.calls and not notes.active
+    assert dialog.questions_button.instate(["disabled"])
+    fake.gate.clear()
+    dialog.regenerate_button.invoke()
+    app.pump()
+    assert dialog.regenerate_button.instate(["disabled"])
+    app.client.history.set_partial("Still updating English", "UU")
+    app.pump()
+    assert "Still updating English" in app.live_text.cget("text").replace("\n", " ")
+    assert app.speaker_var.get() == "S1"
+    dialog.window.withdraw()
+    app.show_summary()
+    assert len(fake.calls) == 1  # opening again never duplicates requests
+    fake.gate.set()
+    for _ in range(40):
+        app.pump(0.05)
+        if not notes.active:
+            break
+    app.pump()
+    assert not notes.error
+    assert "信頼性" in dialog.texts[0].get("1.0", "end")
+    assert "1区間" in dialog.scope.get()
+    dialog.questions_button.invoke()
+    for _ in range(40):
+        app.pump(0.05)
+        if not notes.active:
+            break
+    app.pump()
+    assert "How would you" in dialog.texts[1].get("1.0", "end")
+    assert dialog.notebook.index("current") == 1
+    assert len(fake.calls) == 2
+
+
+def test_summary_dialog_has_independent_monitor_dpi(app, monkeypatch):
+    import realtime_subtitles.ui as ui
+
+    app.show_summary()
+    app.pump()
+    dialog = app.summary_window
+    original = ui.window_dpi
+    old_main_size = app.en_font.cget("size")
+    old_body = dialog.body_font
+    new_dpi = 192 if dialog.scale < 2 else 96
+    monkeypatch.setattr(ui, "window_dpi", lambda w: new_dpi if w is dialog.window else original(w))
+    app.pump()
+    assert dialog.scale == new_dpi / 96
+    assert dialog.body_font is old_body
+    assert dialog.body_font.cget("size") == -round(16 * new_dpi / 96)
+    assert app.en_font.cget("size") == old_main_size
+    assert dialog.window.winfo_width() >= round(460 * dialog.scale)
+    assert not app.lecture_notes.active
+
+
 @pytest.fixture
 def app(tmp_path):
     import tkinter as tk

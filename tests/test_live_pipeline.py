@@ -112,7 +112,8 @@ def test_raw_words_never_split_or_override_agent_segment():
     h = FinalHistory()
     make_unit(h, event("First.", 0, "S1"), "s")
     unknown = make_unit(h, event("Unknown.", 1, "UU"), "s")
-    assert unknown.speaker == "UU" and not unknown.break_before
+    assert unknown.speaker == "S1" and not unknown.break_before
+    assert unknown.raw_source_segments[0].speaker == "UU"
     mixed = event("Hello there.", 2)
     mixed["results"] = [
         {

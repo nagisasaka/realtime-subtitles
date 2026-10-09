@@ -72,7 +72,7 @@ def test_revision_preserves_original_en_ja_context_and_save(tmp_path):
     assert len([r for r in journal if r["kind"] == "history_revision"]) == 2
 
 
-@pytest.mark.parametrize("change", [{"speaker": "S2"}, {"speaker": "UU"}, {"session": "new"}])
+@pytest.mark.parametrize("change", [{"speaker": "S2"}, {"session": "new"}])
 def test_boundaries_prevent_reconstruction(change):
     h = TranslationHistory()
     add(h, "The landscape is")
@@ -97,19 +97,19 @@ def test_unknown_speaker_reconstruction_keeps_sources_and_applies(first, second)
     assert [u.speaker for u in h.segments()] == [first, second]
 
 
-def test_unknown_applied_tail_can_continue_without_crossing_known_speaker_or_session():
+def test_carried_unknown_tail_can_continue_without_crossing_new_speaker_or_session():
     h = TranslationHistory()
     add(h, "Known speaker.")
     first = add(h, "The landscape is", speaker="UU")
-    assert h.reconstructions.plan(first) is None
+    assert h.reconstructions.plan(first) is not None
     target = h.reconstructions.plan(add(h, "changing.", speaker=None))
     complete(h, target, [target.en_text])
     next_target = h.reconstructions.plan(add(h, "Rapidly.", speaker="SU"))
-    assert next_target.en_text == "The landscape is changing. Rapidly."
+    assert next_target.en_text == "Known speaker. The landscape is changing. Rapidly."
     complete(h, next_target, [next_target.en_text])
     assert h.reconstructions.plan(add(h, "Another session.", speaker="UU", session="new")) is None
     assert h.reconstructions.plan(add(h, "Known again.", speaker="S2", session="new")) is None
-    assert h.reconstructions.effective_blocks()[0].en_text == "Known speaker."
+    assert h.reconstructions.effective_blocks()[0].en_text == next_target.en_text
 
 
 def test_clear_and_length_limit():
@@ -643,7 +643,7 @@ def test_queued_tail_can_hit_character_limit_after_parent_completion():
     assert len(h.reconstructions.effective_blocks()) == 2
 
 
-@pytest.mark.parametrize("boundary", ["clear", "session", "speaker", "unknown"])
+@pytest.mark.parametrize("boundary", ["clear", "session", "speaker"])
 def test_tail_never_crosses_display_or_speaker_session_boundaries(boundary):
     h = TranslationHistory()
     add(h, "First.")
@@ -655,7 +655,7 @@ def test_tail_never_crosses_display_or_speaker_session_boundaries(boundary):
     elif boundary == "session":
         kwargs["session"] = "next"
     else:
-        kwargs["speaker"] = "S2" if boundary == "speaker" else "UU"
+        kwargs["speaker"] = "S2"
     assert h.reconstructions.plan(add(h, "Next speech.", **kwargs)) is None
 
 

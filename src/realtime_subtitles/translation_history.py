@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .speaker_policy import UNKNOWN_SPEAKERS
+from .speaker_policy import UNKNOWN_SPEAKERS, grouping_speaker
 from .speechmatics_api import milliseconds
 from .subtitle_view import project_subtitles
 
@@ -27,6 +27,11 @@ class SourceSegment:
     break_before: bool
     raw_event_json: str
     estimated_audio_end_monotonic_ms: int | None = None
+    grouping_speaker: str | None = None
+
+    @property
+    def effective_speaker(self):
+        return self.grouping_speaker if self.grouping_speaker is not None else self.speaker
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,7 @@ class TranslationHistory:
         self.clock = clock
         self.word_metadata = []
         self._journal = []
+        self._analyses = []
         self._seen = set()
         self._revision = 0
         self._display_start = 0
@@ -105,6 +111,13 @@ class TranslationHistory:
             self._journal.append({"kind": "input_end", "session_id": self._session, "state": state})
             self._revision += 1
 
+    def record_analysis(self, record):
+        """Append-only manual lecture notes; use the existing durable autosave journal."""
+        copy = json.loads(json.dumps(record, ensure_ascii=False))
+        with self._lock:
+            self._analyses.append(copy)
+            self._journal.append(copy)
+
     @property
     def revision(self):
         with self._lock:
@@ -123,6 +136,7 @@ class TranslationHistory:
 
     def set_partial(self, text, speaker=None):
         with self._lock:
+            speaker = grouping_speaker(speaker, self._last_speaker) if text else None
             if text and self._segments:
                 last = self._segments[-1]
                 if last.source_segment_ids[-1] == len(self._sources) - 1:
@@ -160,6 +174,9 @@ class TranslationHistory:
                 return None
             self._seen.add(identity)
             changed_session = bool(self._sources) and session_id != self._sources[-1].session_id
+            if self._session != session_id:
+                self._last_speaker = None
+            effective = grouping_speaker(speaker, self._last_speaker)
             boundary = changed_session or bool(
                 self._last_speaker and known_speaker and self._last_speaker != known_speaker
             )
@@ -169,6 +186,7 @@ class TranslationHistory:
                 segment_id=len(self._sources),
                 en_text=text,
                 speaker=speaker,
+                grouping_speaker=effective,
                 start_ms=milliseconds(meta.get("start_time")),
                 end_ms=milliseconds(meta.get("end_time")),
                 session_id=session_id,
@@ -182,8 +200,6 @@ class TranslationHistory:
             )
             self._sources.append(segment)
             self._session = session_id
-            if changed_session:
-                self._last_speaker = None
             if known_speaker:
                 self._last_speaker = known_speaker
             self._journal.append({"kind": "raw_source_segment", **asdict(segment)})
@@ -200,7 +216,7 @@ class TranslationHistory:
                     if len(sources) == 1
                     else " ".join(s.en_text.strip() for s in sources)
                 ),
-                speaker=first.speaker,
+                speaker=first.effective_speaker,
                 start_ms=first.start_ms,
                 end_ms=last.end_ms,
                 session_id=first.session_id,
@@ -364,6 +380,7 @@ class TranslationHistory:
             units = tuple(self._segments)
             sources = tuple(self._sources)
             blocks = self.reconstructions.effective_blocks()
+            analyses = tuple(self._analyses)
         for block in blocks:
             first, last = units[block.start[0]], units[block.end[0]]
             if block.break_before:
@@ -381,6 +398,26 @@ class TranslationHistory:
         for source in sources:
             if source.segment_id not in included:
                 parts.append(f"[source #{source.segment_id} / holding]\nEN: {source.en_text}\n")
+        summary = next((r for r in reversed(analyses) if r["kind"] == "lecture_summary"), None)
+        if summary:
+            parts.append(
+                f"\n[話者別要約 / {summary['generated_at']}]\n{summary['rendered_text']}\n"
+            )
+            scope = summary["snapshot"]
+            parts.append(
+                f"対象: {scope['captured_at']} 時点の確定字幕 {scope['source_count']}区間"
+                f" / 対象外の先頭区間: {scope['omitted_count']}\n"
+            )
+            questions = next(
+                (
+                    r
+                    for r in reversed(analyses)
+                    if r["kind"] == "lecture_questions" and r["summary_id"] == summary["id"]
+                ),
+                None,
+            )
+            if questions:
+                parts.append(f"\n[講演への質問案]\n{questions['rendered_text']}\n")
         return "\n".join(parts)
 
     def save(self, path, *, overwrite=True):
@@ -419,3 +456,7 @@ class TranslationHistory:
                             )
                             + "\n"
                         )
+                with self._lock:
+                    analyses = tuple(self._analyses)
+                for record in analyses:
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")

@@ -17,6 +17,7 @@ from .audio import list_microphones
 from .audio_file import inspect_wav
 from .autosave import TranscriptAutosave
 from .history_reconstruction import original_block, replacement_slice
+from .lecture_summary import LectureNotes
 from .live_client import LiveClient
 from .realtime_api import State
 from .settings import Settings
@@ -237,6 +238,8 @@ class SubtitleApp:
     ):
         self.root = root
         self.client = client if client is not None else LiveClient()
+        self.lecture_notes = LectureNotes(self.client.history)
+        self.summary_window = None
         self.autosave = TranscriptAutosave({"subtitles": self.client.history})
         self._render_key = None
         self._render_count = 0
@@ -469,6 +472,10 @@ class SubtitleApp:
             status, text="設定", command=self.show_settings, width=5, style="Subtitle.TButton"
         )
         self.settings_button.pack(side="right")
+        self.summary_button = ttk.Button(
+            status, text="要約", command=self.show_summary, width=5, style="Subtitle.TButton"
+        )
+        self.summary_button.pack(side="right", padx=(0, 6))
         self.latest_button = ttk.Button(
             status,
             text="最新へ ↑",
@@ -480,7 +487,7 @@ class SubtitleApp:
         ttk.Label(status, textvariable=self.speaker_var).pack(side="right", padx=16)
         self.progress = ttk.Progressbar(status, maximum=100, length=100)
         for widget in [status, *status.winfo_children()]:
-            if widget not in (self.settings_button, self.latest_button):
+            if widget not in (self.settings_button, self.latest_button, self.summary_button):
                 widget.bind("<ButtonPress-1>", self._drag_start)
                 widget.bind("<B1-Motion>", self._drag_move)
 
@@ -1369,6 +1376,15 @@ class SubtitleApp:
 
         threading.Thread(target=work, name="transcript-save", daemon=False).start()
 
+    def show_summary(self):
+        if self.closing:
+            return
+        if self.summary_window is None or not self.summary_window.window.winfo_exists():
+            from .summary_ui import SummaryWindow
+
+            self.summary_window = SummaryWindow(self.root, self.lecture_notes)
+        self.summary_window.show()
+
     def show_diagnostics(self):
         if self.diagnostic_window and self.diagnostic_window.winfo_exists():
             self.diagnostic_window.lift()
@@ -1436,6 +1452,8 @@ class SubtitleApp:
             pass
         self._refresh_dpi()  # Includes initial map and DPI changes without a resize.
         self._refresh_settings_dpi()
+        if self.summary_window:
+            self.summary_window.refresh()
         snapshot = self.client.snapshot()
         snapshot["display"] = {
             "dpi": round(self.scale * 96),
@@ -1512,7 +1530,12 @@ class SubtitleApp:
                 self.diagnostic_text.insert("1.0", diagnostic)
                 self.diagnostic_text.configure(state="disabled")
                 self._last_diagnostic = diagnostic
-        if self.closing and not self.client.active and not self.saving:
+        if (
+            self.closing
+            and not self.client.active
+            and not self.saving
+            and not self.lecture_notes.active
+        ):
             self.autosave.request_close()
             if self.autosave.active:
                 self._poll_id = self.root.after(33, self._poll)
@@ -1529,6 +1552,7 @@ class SubtitleApp:
             self._save_id = None
         self._save_settings()
         self.closing = True
+        self.lecture_notes.request_close()
         self._clear_history_flashes()
         self.click_through.set(False)
         self._toggle_click_through()

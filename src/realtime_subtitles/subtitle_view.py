@@ -33,7 +33,7 @@ def project_subtitles(unit, pending, partial, partial_speaker, advanced_unit_id=
     )
     if partial:
         text = " ".join(part for part in (text, partial) if part)
-    speaker = pending[-1].speaker if pending else unit.speaker if unit else None
+    speaker = pending[-1].effective_speaker if pending else unit.speaker if unit else None
     changed = pending[0].break_before if pending else unit.break_before if unit else False
     known = {None, "", "UU", "SU"}
     if partial and partial_speaker not in known:
