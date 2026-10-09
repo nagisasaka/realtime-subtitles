@@ -891,7 +891,11 @@ class SubtitleApp:
         def size(value):
             return int(text.tk.call("string", "length", value))
 
-        for block in blocks:
+        # Source ranges stay chronological for matching/export, but every screen
+        # paragraph must be newest-first, including paragraphs within a revision.
+        # Reverse whole EN/JA pairs, never the text inside a paragraph.
+        display_blocks = tuple(reversed(blocks))
+        for block in display_blocks:
             speaker = f"↳ {block.speaker or ''}\n" if block.break_before else ""
             ja = (block.ja_text or "") + "\n"
             offsets.append(
@@ -900,7 +904,7 @@ class SubtitleApp:
             chunks.extend((speaker, "speaker", ja, "ja", block.en_text + "\n", "en"))
             rendered += speaker + ja + block.en_text + "\n"
         text.insert(position, *chunks)
-        for block, (start, ja, en) in zip(blocks, offsets, strict=True):
+        for block, (start, ja, en) in zip(display_blocks, offsets, strict=True):
             end = en + size(block.en_text + "\n")
             for suffix, offset in [("start", start), ("ja", ja), ("en", en), ("end", end)]:
                 mark = f"block_{block.key}_{suffix}"

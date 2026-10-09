@@ -396,6 +396,60 @@ def complete_revision(history, target, japanese):
     history.reconstructions.update_translation(target.unit_id, "completed", text=japanese)
 
 
+@pytest.mark.parametrize("coalesced", [False, True])
+def test_retranslated_paragraphs_always_render_newest_first(app, coalesced):
+    from realtime_subtitles.history_reconstruction import ReconstructedParagraph
+
+    h = app.client.history
+    make_unit(h, event("Older baseline.", 0), "s")
+    make_unit(h, event("First 🚀 thought. Middle thought.", 1), "s")
+    second = make_unit(h, event("Newest thought.", 2), "s")
+    a = h.reconstructions.plan(second)
+    continuation = make_unit(h, event("Continuation 🚀.", 3), "s")
+    h.set_partial("Live English", "S1")
+    app.pump()
+    widget = app.history_text
+    live_bounds = app.live_text.winfo_y(), app.live_text.winfo_height()
+    parts = []
+    for en, ja in [
+        ("First 🚀 thought.", "最初の考え。"),
+        ("Middle thought.", "途中の考え。"),
+        ("Newest thought.", "最新の考え。"),
+    ]:
+        start = a.en_text.index(en)
+        parts.append(ReconstructedParagraph(start, start + len(en), ja))
+    h.reconstructions.set_paragraphs(a.unit_id, tuple(parts))
+    h.reconstructions.update_translation(a.unit_id, "completed", text="再翻訳結果")
+
+    def assert_order():
+        blocks = h.reconstructions.effective_blocks()
+        expected = "".join(f"{b.ja_text or '翻訳待ち…'}\n{b.en_text}\n" for b in reversed(blocks))
+        assert widget.get("1.0", "end-1c") == expected
+        # Internal history and exported TXT remain chronological.
+        assert app._history_starts == sorted(app._history_starts)
+        saved = h.saved_text()
+        positions = [saved.index(f"EN: {b.en_text}\n") for b in blocks]
+        assert positions == sorted(positions)
+        assert app.history_text is widget
+        assert (app.live_text.winfo_y(), app.live_text.winfo_height()) == live_bounds
+
+    if not coalesced:
+        app.pump()
+        assert_order()
+    # Revisit only the tail: the earlier two paragraphs must remain below it.
+    b = h.reconstructions.plan(continuation)
+    assert b.en_text == "Newest thought. Continuation 🚀."
+    complete_revision(h, b, "最新の考えと続き。")
+    app.pump()
+    assert_order()
+    h.update_translation(second.unit_id, "completed", text="古い単独訳")
+    make_unit(h, event("Newest standalone.", 4), "s")
+    h.set_partial("Still live", "S1")
+    app.pump()
+    assert_order()
+    assert "古い単独訳" not in widget.get("1.0", "end")
+
+
 def test_monitor_dpi_updates_pixel_fonts_and_layout_without_recreating_widgets(app, monkeypatch):
     dpi = [168]
     monkeypatch.setattr("realtime_subtitles.ui.window_dpi", lambda root: dpi[0])
