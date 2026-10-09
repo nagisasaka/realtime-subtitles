@@ -7,8 +7,9 @@ A lone final intentionally waits through silence. Raw sources remain immutable.
 import threading
 import time
 
+from .speaker_policy import UNKNOWN_SPEAKERS, same_speaker_group
+
 FINALS_PER_UNIT = 2
-UNKNOWN_SPEAKERS = {None, "", "UU", "SU"}
 
 
 class TranslationUnitAssembler:
@@ -44,8 +45,8 @@ class TranslationUnitAssembler:
                 same = (
                     source.session_id is not None
                     and source.session_id == previous.session_id
-                    and source.speaker not in UNKNOWN_SPEAKERS
-                    and source.speaker == previous.speaker
+                    and same_speaker_group(source.speaker, previous.speaker)
+                    and not source.break_before
                 )
                 if not same:
                     self._flush("speaker_or_session_boundary")

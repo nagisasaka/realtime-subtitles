@@ -111,13 +111,49 @@ def test_flush_retains_pending(reason):
     assert len(h.segments()) == 1 and h.segments()[0].assembly_reason == reason
 
 
-def test_unknown_speaker_and_session_do_not_merge():
-    for kwargs in ({"speaker": "UU"}, {"speaker": None}, {"session": None}):
-        _, h, a, feed = harness()
-        feed("Unknown.", **kwargs)
-        feed("Continuation.", 1, 2, **kwargs)
-        a.flush("eos")
-        assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]
+@pytest.mark.parametrize("first", ["UU", "SU", None, ""])
+@pytest.mark.parametrize("second", ["UU", "SU", None, ""])
+def test_unknown_speaker_run_pairs_without_inventing_identity(first, second):
+    _, h, a, feed = harness()
+    feed("The landscape is", speaker=first)
+    feed("changing.", 1, 2, speaker=second)
+    (unit,) = h.segments()
+    assert unit.source_segment_ids == (0, 1)
+    assert unit.en_text == "The landscape is changing."
+    assert unit.speaker == first and not unit.break_before
+    assert [s.speaker for s in unit.raw_source_segments] == [first, second]
+    assert not a.pending
+
+
+@pytest.mark.parametrize("speaker", ["S1", "UU", None])
+def test_unknown_session_does_not_merge(speaker):
+    _, h, a, feed = harness()
+    feed("Unknown.", speaker=speaker, session=None)
+    feed("Continuation.", 1, 2, speaker=speaker, session=None)
+    a.flush("eos")
+    assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]
+
+
+def test_unknown_run_does_not_bridge_known_speakers_or_partials():
+    _, h, a, feed = harness()
+    feed("Known speaker.")
+    feed("Unattributed first.", 1, 2, speaker="UU")
+    feed("Unattributed second.", 2, 3, speaker=None)
+    feed("Unattributed third.", 3, 4, speaker="UU")
+    a.note_speaker("S2", "a")
+    feed("Other speaker.", 4, 5, speaker="S2")
+    feed("Continues.", 5, 6, speaker="S2")
+    assert [u.source_segment_ids for u in h.segments()] == [(0,), (1, 2), (3,), (4, 5)]
+    assert [u.speaker for u in h.segments()] == ["S1", "UU", "UU", "S2"]
+    assert h.segments()[-1].break_before
+
+
+def test_unknown_speaker_run_flushes_at_session_boundary():
+    _, h, a, feed = harness()
+    feed("Previous session.", speaker="UU")
+    feed("New session.", 1, 2, speaker="UU", session="b")
+    a.flush("eos")
+    assert [u.source_segment_ids for u in h.segments()] == [(0,), (1,)]
 
 
 def test_punctuation_and_long_audio_gap_do_not_split_pairs():

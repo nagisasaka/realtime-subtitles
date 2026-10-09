@@ -68,10 +68,11 @@ TXTの時刻は元unitの範囲であり、切り出した文字位置の正確�
 履歴を読み直している間は、可能な限り英語文字位置を閲覧位置として保ちます。
 
 モデルは両段階とも `gpt-6-luna / reasoning.effort=none`。初回翻訳に加えて2段階のAPI料金・遅延が
-発生します。同じ既知話者が続く場合、新unitごとに1見直しを予約します。
+発生します。同じ既知話者または話者不明の区間が続く場合、新unitごとに1見直しを予約します。
 旧方式は3 unitsにつき最大2見直しだったため、成功が続く場合の履歴側の呼び出し頻度は約1.5倍になります。
 専用workerは1並列・待ちqueueは最大2件。混雑時は再構成をskipして元の字幕を残します。
-同じ既知話者の範囲だけを対象に、話者／session／Clearの境界を越えません。
+同じ既知話者の範囲、または連続する話者不明の範囲を対象とし、既知話者との境界／session／Clearを越えません。
+話者不明（UU/SU/ラベル欠落）の連続も処理を継続します。同一人物とは推定せず、raw speaker情報を保持します。
 Diagnosticsの `history_reconstruction` で件数・queue・失敗状態を確認できます。
 新方式の実測・テスト結果は [実装レポート](docs/history-split-first-implementation.md) に記載しています。
 分割プロンプト改善後のEarnings22試験は [改善評価](docs/history-dependency-prompt-evaluation.md) に記載しています。
@@ -307,11 +308,12 @@ WAVデコードは標準ライブラリなので、新たなデコーダDLL・�
 ## 翻訳単位・文脈・話者
 
 **AddSegmentはraw確定ENとして即座に保存・表示し、TranslationUnitは別に組み立てます。**
-同じ認識session・既知の同speakerの**finalを2件ずつ**結合して、Lunaへ1回のTARGETとして送ります。
+同じ認識session内で、既知の同speakerまたは連続する話者不明の**finalを2件ずつ**結合して、Lunaへ1回のTARGETとして送ります。
 句読点・文の完結判定・音声gap・1.5秒タイマーによるflushは廃止しました。
 1件目だけで無音になった場合は期限なしで待ちます。英語はそのまま表示し、日本語はまだ要求しません。
 既知の別speakerのpartial／final、session変更、Stop、EOS、切断では残り1件をflushします。
-話者不明（UU/SU等）やsession不明のfinal同士は同一話者と推定せず、次のfinal／終了時に単独unitとして扱います。
+話者不明（UU/SU/ラベル欠落）は人物IDを補完せず、連続する区間内で結合・履歴再翻訳を継続します。
+既知話者と話者不明の切替では結合を区切り、session不明のfinal同士は結合しません。
 保留件数は最大1件、送出unitは最大2件のraw segmentです。時間による独自の字幕移動はありません。
 EOFではサーバーの最後のfinalを回収してから残りをflushし、未完了の翻訳を既存の上限内でdrainします。
 rawの`segment.transcript`を維持し、結合時は自然な単語間スペースでつなぎ、`segment.speaker`と`metadata.start_time/end_time`を保持します。

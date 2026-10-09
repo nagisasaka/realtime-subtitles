@@ -7,11 +7,11 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .speaker_policy import UNKNOWN_SPEAKERS
 from .speechmatics_api import milliseconds
 from .subtitle_view import project_subtitles
 
 TRANSLATION_CONTEXT_SEGMENTS = 5
-UNKNOWN_SPEAKERS = {None, "", "UU", "SU"}
 
 
 @dataclass(frozen=True)

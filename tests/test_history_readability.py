@@ -38,7 +38,7 @@ def test_replay_uses_production_pairs_context_and_immutable_raw():
     assert len(a[0]["raw_sources"]) == 4
 
 
-def test_partial_speaker_change_flushes_and_unknown_not_joined():
+def test_partial_speaker_change_flushes_and_unknown_run_stays_separate():
     rows = [
         event("a", 0),
         event("b", 1, kind="AddPartialSegment", speaker="S2"),
@@ -48,10 +48,12 @@ def test_partial_speaker_change_flushes_and_unknown_not_joined():
         event("e", 5, speaker="S2"),
         event("x", 6, speaker="UU"),
         event("x", 7, speaker="UU"),
-        event("", 8, kind="EndOfTranscript"),
+        event("y", 8, speaker="UU"),
+        event("y", 9, speaker="UU"),
+        event("", 10, kind="EndOfTranscript"),
     ]
     windows = replay(rows)
-    assert [w["english"] for w in windows] == ["b c d e"]
+    assert [w["english"] for w in windows] == ["b c d e", "x x y y"]
     assert windows[0]["context"][0]["text"] == "a"
 
 

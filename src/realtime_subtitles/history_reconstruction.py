@@ -9,8 +9,9 @@ from dataclasses import asdict, dataclass, replace
 
 from pydantic import BaseModel, StrictInt
 
+from .speaker_policy import same_speaker_group
 from .text_translation import MODEL, OpenAITranslator, TranslationWorker, safe_error
-from .translation_history import UNKNOWN_SPEAKERS, TranslationUnit
+from .translation_history import TranslationUnit
 from .translation_validation import TranslationValidator
 
 MAX_REVISION_CHARS = 1800
@@ -380,8 +381,7 @@ class ReconstructionHistory:
         if not (
             current.session_id is not None
             and current.session_id == previous.session_id
-            and current.speaker not in UNKNOWN_SPEAKERS
-            and current.speaker == previous.speaker
+            and same_speaker_group(current.speaker, previous.speaker)
             and not current.break_before
         ):
             return None
@@ -397,7 +397,7 @@ class ReconstructionHistory:
         if first.source_segment_ids[0] < self.owner._display_start:
             return None
         if any(
-            u.session_id != current.session_id or u.speaker != current.speaker
+            u.session_id != current.session_id or not same_speaker_group(u.speaker, current.speaker)
             for u in units[ids[0] : i + 1]
         ):
             return None

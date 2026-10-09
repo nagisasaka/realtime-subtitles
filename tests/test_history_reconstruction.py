@@ -79,6 +79,39 @@ def test_boundaries_prevent_reconstruction(change):
     assert h.reconstructions.plan(add(h, "changing.", **change)) is None
 
 
+@pytest.mark.parametrize("first", ["UU", "SU", None, ""])
+@pytest.mark.parametrize("second", ["UU", "SU", None, ""])
+def test_unknown_speaker_reconstruction_keeps_sources_and_applies(first, second):
+    h = TranslationHistory()
+    add(h, "The landscape is", speaker=first)
+    unit = add(h, "changing.", speaker=second)
+    originals = [asdict(s) for s in h.sources()]
+    target = h.reconstructions.plan(unit)
+    assert target.en_text == "The landscape is changing."
+    assert target.speaker == second
+    assert h.reconstructions.prepare(target.unit_id) == target
+    complete(h, target, [target.en_text], ["状況は変化しています。"])
+    assert h.reconstructions.entries()[0].applied
+    assert h.reconstructions.effective_blocks()[0].ja_text == "状況は変化しています。"
+    assert [asdict(s) for s in h.sources()] == originals
+    assert [u.speaker for u in h.segments()] == [first, second]
+
+
+def test_unknown_applied_tail_can_continue_without_crossing_known_speaker_or_session():
+    h = TranslationHistory()
+    add(h, "Known speaker.")
+    first = add(h, "The landscape is", speaker="UU")
+    assert h.reconstructions.plan(first) is None
+    target = h.reconstructions.plan(add(h, "changing.", speaker=None))
+    complete(h, target, [target.en_text])
+    next_target = h.reconstructions.plan(add(h, "Rapidly.", speaker="SU"))
+    assert next_target.en_text == "The landscape is changing. Rapidly."
+    complete(h, next_target, [next_target.en_text])
+    assert h.reconstructions.plan(add(h, "Another session.", speaker="UU", session="new")) is None
+    assert h.reconstructions.plan(add(h, "Known again.", speaker="S2", session="new")) is None
+    assert h.reconstructions.effective_blocks()[0].en_text == "Known speaker."
+
+
 def test_clear_and_length_limit():
     h = TranslationHistory()
     add(h, "The landscape is")

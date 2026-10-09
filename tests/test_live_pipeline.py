@@ -90,6 +90,24 @@ def test_only_final_pair_triggers_translation_partial_replaces():
     assert len(client.history.segments()) == 1
 
 
+def test_unknown_speaker_finals_keep_both_translation_stages_running():
+    client = LiveClient()
+    client.speechmatics = SimpleNamespace(session_id="s")
+    units, revisions = [], []
+    client.translation = SimpleNamespace(submit=units.append)
+    client.reconstruction = SimpleNamespace(submit=revisions.append)
+    for i, speaker in enumerate(("UU", None, "SU", "")):
+        client._receive(event(f"Live {i}", i, speaker, final=False), ())
+        assert client.history.subtitle_view().en_text.endswith(f"Live {i}")
+        client._receive(event(f"Final {i}.", i, speaker), ())
+    assert [u.source_segment_ids for u in units] == [(0, 1), (2, 3)]
+    (target,) = revisions
+    assert target.source_segment_ids == (0, 1, 2, 3)
+    assert target.en_text == "Final 0. Final 1. Final 2. Final 3."
+    assert [s.speaker for s in client.history.sources()] == ["UU", None, "SU", ""]
+    assert not client.reconstruction_error
+
+
 def test_raw_words_never_split_or_override_agent_segment():
     h = FinalHistory()
     make_unit(h, event("First.", 0, "S1"), "s")
