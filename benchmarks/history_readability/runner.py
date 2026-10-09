@@ -68,17 +68,17 @@ class Budget:
 
 
 class Runner:
-    def __init__(self, directory, client, *, seconds=480, clock=time.monotonic):
+    def __init__(self, directory, client, *, seconds=480, clock=time.monotonic, request_limit=80):
         self.directory, self.client = Path(directory), client
         self.clock, self.deadline = clock, clock() + min(seconds, 480)
-        self.budget = Budget(self.directory / "ledger.json")
+        self.budget = Budget(self.directory / "ledger.json", limit=request_limit)
         self.semaphore = asyncio.Semaphore(2)
 
-    async def call(self, label, prompt, data, schema, *, nonce=""):
+    async def call(self, label, prompt, data, schema, *, nonce="", model=MODEL, effort="none"):
         identity = digest(
             {
-                "model": MODEL,
-                "reasoning": "none",
+                "model": model,
+                "reasoning": effort,
                 "prompt": prompt,
                 "input": data,
                 "schema": schema.model_json_schema(),
@@ -95,12 +95,18 @@ class Runner:
                 return {"status": "deadline", "label": label, "identity": identity}
             index = self.budget.reserve(identity)
             started = self.clock()
-            result = {"label": label, "identity": identity, "prompt_hash": digest(prompt)}
+            result = {
+                "label": label,
+                "identity": identity,
+                "prompt_hash": digest(prompt),
+                "model": model,
+                "reasoning": effort,
+            }
             try:
                 async with asyncio.timeout(min(45, remaining)):
                     response = await self.client.responses.parse(
-                        model=MODEL,
-                        reasoning={"effort": "none"},
+                        model=model,
+                        reasoning={"effort": effort},
                         store=False,
                         instructions=prompt,
                         input=json.dumps(data, ensure_ascii=False),

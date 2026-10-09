@@ -105,6 +105,11 @@ def test_cache_keys_cover_prompt_context_schema_and_regeneration(tmp_path):
         await r.call("w", "p", {"c": "a"}, Verdict)
         await r.call("w", "p", {"c": "a"}, EnglishSplit, nonce="repeat")
         assert len(calls) == 5
+        await r.call("w", "p", {"c": "a"}, EnglishSplit, model="gpt-6-astra", effort="low")
+        await r.call("w", "p", {"c": "a"}, EnglishSplit, model="gpt-6-astra", effort="medium")
+        assert len(calls) == 7
+        assert calls[-2]["model"] == "gpt-6-astra"
+        assert calls[-2]["reasoning"] == {"effort": "low"}
         assert calls[0]["max_output_tokens"] == 5000
 
     asyncio.run(run())

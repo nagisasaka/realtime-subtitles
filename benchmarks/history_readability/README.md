@@ -1,5 +1,65 @@
 # 履歴再翻訳の小規模評価
 
+## 5案以上の自然さ比較（2026-10-09）
+
+新しい[比較計画](../../docs/history-naturalness-plan.md)では、固定入力・Luna生成・
+Astraによる匿名判定を使う。最初の5案と、結果を踏まえた追加案を区別して保存する。
+
+```bash
+.venv/bin/python -m benchmarks.history_readability.naturalness \
+  --output benchmark_results/history_readability/naturalness_20261008 \
+  --source /workspace/jimaku-earnings-benchmark/benchmark_results/earnings22/20261008_arqit_completed \
+  --anchors benchmarks/history_readability/naturalness_anchors.json --prepare
+.venv/bin/python -m benchmarks.history_readability.naturalness \
+  --output benchmark_results/history_readability/naturalness_20261008 --variant baseline
+```
+
+続けて `--variant discourse / japanese_syntax / concise / referents / terminology` を
+1プロセスずつ実行する。原文・context・prompt・判定基準はmanifestに固定され、
+元データの変更はSHA-256照合で拒否する。既定300秒、最大480秒、同時要求2、全試行240回まで。
+
+追加案は `--variant-file <JSON>` で指定する。
+JSONには `id`、`parent_manifest_hash`、`config: {title, split, translation}` と選定理由を記録し、
+元の5案とmanifestを上書きしない。`--split holdout` は開発評価後に使用する。
+`--reverse` で判定の左右を逆にする。`--nonce repeat1 --ids ...` で独立再生成し、
+両案を再生成した場合は `--baseline-run baseline.dev.repeat1.json` を指定して比較する。
+
+本番の末尾持ち越しも含めた評価:
+
+```bash
+.venv/bin/python -m benchmarks.history_readability.naturalness_tail \
+  --output benchmark_results/history_readability/naturalness_20261008 \
+  --variant reverse_cohesion \
+  --variant-file benchmark_results/history_readability/naturalness_20261008/reverse_cohesion.json \
+  --ids 4474955-r6 4474955-r17
+```
+
+同一の確定履歴を起点に、両案それぞれ3 unitを順次追加する。
+元の英文と再翻訳対象外の段落が維持されることを検査し、最後の履歴を匿名採点する。
+JSONL/TXT出力も保存する。Speechmatics、マイク、音声再生は使用しない。
+
+Windowsでは `native_preview` が本番の `SubtitleApp` を使って保存済み出力を描画する。
+独立した一時設定を使い、`start` 自体を無効化するため、音声/API接続は開始しない。
+`--width` は96 DPI相当の幅。実際の幅・DPI・行数・最新順・英日表示順を記録する。
+既存の `preview` は2列比較用であり、実際の履歴順の検証には `native_preview` を使う。
+
+```powershell
+python -m benchmarks.history_readability.native_preview `
+  --manifest benchmark_results/naturalness/manifest.json `
+  --run benchmark_results/naturalness/reverse_cohesion.dev.json `
+  --events benchmark_results/naturalness/events.jsonl `
+  --id 4474955-r9 --width 700 `
+  --output benchmark_results/naturalness/native.json `
+  --screenshot benchmark_results/naturalness/native.png
+```
+
+入力ファイルはWSLの無視対象directoryからWindowsの検証用directoryへコピーする。
+`events.jsonl` はmanifestが指す読み取り専用のsourceから取得する。常用アプリへは同期しない。
+API試行時間と、音声受信から字幕までの時間は別物。LLM判定は人間評価の代替指標であり、
+人間の被験者実験や統計的な性能保証とは扱わない。
+
+以下は以前の3案比較用ツールの説明。
+
 保存済みAgent STTイベントを本番のfinal結合・再構成window plannerへ通し、同じ英文/contextで再翻訳promptを比較する。マイクとSpeechmaticsは起動しない。
 現在は本番と同じ英文分割→ID付き一括翻訳の2段階。`--prompt` は英文分割側だけを変更し、翻訳プロンプトはmanifestに固定する。
 旧 `run1` は旧方式の評価記録のため再利用せず、新しいmanifestを準備する（旧形式はrunnerが拒否する）。
