@@ -366,10 +366,12 @@ def test_semantic_paragraphs_can_split_inside_old_units_and_keep_reading_anchor(
     text = app.history_text
     # Split within unit 15, which used to be indivisible in the history UI.
     cut = a.en_text.index("number 15")
+    middle = a.en_text.index("Sentence number 14.")
     h.reconstructions.set_paragraphs(
         a.unit_id,
         (
-            ReconstructedParagraph(0, cut - 1, "最初の部分。"),
+            ReconstructedParagraph(0, middle - 1, "最初の部分。"),
+            ReconstructedParagraph(middle, cut - 1, "途中の部分。"),
             ReconstructedParagraph(cut, len(a.en_text), "後ろの部分。"),
         ),
     )
@@ -381,14 +383,14 @@ def test_semantic_paragraphs_can_split_inside_old_units_and_keep_reading_anchor(
     app.pump()
     assert "number 15." in text.get("@0,0", "@0,0 lineend")
     b = h.reconstructions.prepare(b.unit_id)
-    assert b.en_text == "number 15. Sentence number 16."
+    assert b.en_text == "Sentence number 14. Sentence number 15. Sentence number 16."
     complete_revision(h, b, "新しい後半。")
     app.pump()
-    assert "number 15." in text.get("@0,0", "@0,0 lineend")
+    assert "number 15." in text.get("@0,0", "@0,0 + 150 chars")
     content = text.get("1.0", "end")
     assert content.count("Sentence number 14.") == 1
     assert content.count("number 15.") == 1
-    assert "新しい後半。\nnumber 15. Sentence number 16." in content
+    assert "新しい後半。\nSentence number 14. Sentence number 15. Sentence number 16." in content
     assert "最初の部分。" in content  # Prefix JA was never sent or replaced.
 
 
@@ -424,9 +426,9 @@ def test_surface_cleanup_renders_without_losing_raw_offsets_or_live_frame(app):
     y, height = app.live_text.winfo_y(), app.root.winfo_height()
     chunks, rejected = apply_join_cleanup(
         target.en_text,
-        split_english(target.en_text, EnglishSplit(end_tokens=[3])),
-        [JoinCleanup(start_token=2, remove_previous_punctuation=True, lowercase_initial=True)],
-        (2,),
+        split_english(target.en_text, EnglishSplit(end_tokens=[1, 5])),
+        [JoinCleanup(start_token=4, remove_previous_punctuation=True, lowercase_initial=True)],
+        (2, 4),
     )
     assert not rejected
     h.reconstructions.set_chunks(target.unit_id, chunks)
@@ -434,7 +436,12 @@ def test_surface_cleanup_renders_without_losing_raw_offsets_or_live_frame(app):
         target.unit_id,
         pair_translations(
             chunks,
-            BatchTranslation(translations=[{"id": 0, "ja": "もっと容量が必要です。"}]),
+            BatchTranslation(
+                translations=[
+                    {"id": 0, "ja": "以前の文。"},
+                    {"id": 1, "ja": "もっと容量が必要です。"},
+                ]
+            ),
         ),
     )
     h.reconstructions.update_translation(target.unit_id, "completed", text="もっと容量が必要です。")
@@ -471,6 +478,7 @@ def test_retranslated_paragraphs_always_render_newest_first(app, coalesced):
     live_bounds = app.live_text.winfo_y(), app.live_text.winfo_height()
     parts = []
     for en, ja in [
+        ("Older baseline.", "古い文。"),
         ("First 🚀 thought.", "最初の考え。"),
         ("Middle thought.", "途中の考え。"),
         ("Newest thought.", "最新の考え。"),
@@ -495,9 +503,9 @@ def test_retranslated_paragraphs_always_render_newest_first(app, coalesced):
     if not coalesced:
         app.pump()
         assert_order()
-    # Revisit only the tail: the earlier two paragraphs must remain below it.
+    # Revisit the last two paragraphs; older paragraphs remain below them.
     b = h.reconstructions.plan(continuation)
-    assert b.en_text == "Newest thought. Continuation 🚀."
+    assert b.en_text == "Middle thought. Newest thought. Continuation 🚀."
     complete_revision(h, b, "最新の考えと続き。")
     app.pump()
     assert_order()
@@ -667,10 +675,12 @@ def test_tail_replacement_keeps_prefix_widget_anchor_and_live_frame(app):
     units.append(make_unit(h, event("Keep this prefix. With our", 15), "s"))
     a = h.reconstructions.plan(units[-1])
     cut = a.en_text.index("With our")
+    middle = a.en_text.index("Sentence 14.")
     h.reconstructions.set_paragraphs(
         a.unit_id,
         (
-            ReconstructedParagraph(0, cut - 1, "変更しない前半。"),
+            ReconstructedParagraph(0, middle - 1, "変更しない前半。"),
+            ReconstructedParagraph(middle, cut - 1, "直前の考え。"),
             ReconstructedParagraph(cut, len(a.en_text), "当社の"),
         ),
     )
@@ -679,13 +689,21 @@ def test_tail_replacement_keeps_prefix_widget_anchor_and_live_frame(app):
     app.pump()
     widget, y = app.history_text, app.live_text.winfo_y()
     prefix_mark = "prefix_probe"
-    widget.mark_set(prefix_mark, app._history_english_runs[15][0][0])
+    widget.mark_set(prefix_mark, app._history_english_runs[13][0][0])
     before = widget.get(prefix_mark, f"{prefix_mark} lineend")
     u = make_unit(h, event("new platform 🚀.", 16), "s")
     h.set_partial("Next live partial", "S1")
     b = h.reconstructions.plan(u)
-    assert b.en_text == "With our new platform 🚀."
-    complete_revision(h, b, "当社の新しい基盤。")
+    assert b.en_text == "Sentence 14. Keep this prefix. With our new platform 🚀."
+    cut = b.en_text.index("With our")
+    h.reconstructions.set_paragraphs(
+        b.unit_id,
+        (
+            ReconstructedParagraph(0, cut - 1, "直前の考え。"),
+            ReconstructedParagraph(cut, len(b.en_text), "当社の新しい基盤。"),
+        ),
+    )
+    h.reconstructions.update_translation(b.unit_id, "completed", text="当社の新しい基盤。")
     app.pump()
     text = widget.get("1.0", "end")
     assert text.count("変更しない前半。") == 1

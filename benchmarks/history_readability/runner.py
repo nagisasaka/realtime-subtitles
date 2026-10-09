@@ -141,7 +141,6 @@ class Runner:
         *,
         nonce="",
         translation_prompt=BATCH_TRANSLATION_INSTRUCTIONS,
-        protected_prefix_chars=0,
     ):
         data = {
             "CONTEXT": window["context"],
@@ -155,7 +154,6 @@ class Runner:
             "id": window["id"],
             "input_hash": digest(data),
             "attempts": attempts,
-            "protected_prefix_chars": protected_prefix_chars,
         }
         call = await self.call(window["id"] + "-split", prompt, data, EnglishSplit, nonce=nonce)
         attempts.append(dict(call, stage="split"))
@@ -166,7 +164,6 @@ class Runner:
             chunks = split_english(
                 window["english"],
                 EnglishSplit.model_validate(call["parsed"]),
-                protected_prefix_chars=protected_prefix_chars,
             )
         except ValueError as exc:
             return dict(result, status="structural_failure", structural_error=type(exc).__name__)

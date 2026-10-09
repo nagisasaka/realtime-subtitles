@@ -75,6 +75,24 @@ def test_warning_does_not_retry():
     assert result.retry_count == 0 and result.ja_text == "二秒"
 
 
+def test_omitted_time_unit_is_saved_as_warning_without_quality_retry():
+    h, unit = setup_unit("We'll leave the last 10 to 15 uh, for questions.")
+    calls = []
+
+    class Translator:
+        async def translate(self, target, context, **kwargs):
+            calls.append(kwargs)
+            return "最後の10〜15分は質問をお受けします。", None
+
+    asyncio.run(TranslationWorker(h, "test")._one(Translator(), unit, []))
+    result = h.segments()[0]
+    assert result.translation_status == "completed"
+    assert result.validation_status == "warning"
+    assert result.retry_count == 0 and len(calls) == 1
+    assert result.validation_issues[0]["code"] == "unit_omitted"
+    assert result.en_text == unit.en_text
+
+
 def test_validator_failure_isolated_and_candidate_saved():
     h, unit = setup_unit()
 

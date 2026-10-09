@@ -190,7 +190,9 @@ def test_sequential_trial_uses_real_tail_planner_and_preserves_raw_and_prefix():
     )
     assert result["status"] == "valid"
     assert result["source_preserved"] and result["prefix_preserved"]
-    assert jobs[0][0]["english"] == "The system is fast."
-    assert jobs[0][1]["protected_prefix_chars"] == len("The system")
+    assert jobs[0][0]["english"] == "Keep this. The system is fast."
+    assert "protected_prefix_chars" not in jobs[0][1]
     assert len(jobs) == 3
-    assert history.reconstructions.effective_blocks()[0].ja_text == "維持。"
+    assert history.reconstructions.effective_blocks()[0].en_text == (
+        "Keep this. The system is fast. And stable. Next topic."
+    )

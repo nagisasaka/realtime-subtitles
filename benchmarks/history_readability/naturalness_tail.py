@@ -21,9 +21,6 @@ async def arm(runner, source_units, window, initial, following, prompts, *, nonc
     for unit in source_units[: window["unit_ids"][-1] + 1]:
         add_saved_unit(history, unit)
     seed(history, window, initial)
-    prefix = tuple(
-        b for b in history.reconstructions.effective_blocks() if b.start[0] >= window["unit_ids"][0]
-    )[:-1]
     steps = []
     for unit in following:
         current = add_saved_unit(history, unit)
@@ -33,6 +30,9 @@ async def arm(runner, source_units, window, initial, following, prompts, *, nonc
         target = history.reconstructions.prepare(target.unit_id)
         if target is None:
             raise ValueError("Selected continuation skipped")
+        revision = history.reconstructions.entries()[target.unit_id]
+        start = (revision.unit_ids[0], revision.first_unit_offset)
+        prefix = tuple(b for b in history.reconstructions.effective_blocks() if b.start < start)
         job = {
             "id": window["id"] + f"-tail-{current.unit_id}",
             "english": target.en_text,
@@ -43,9 +43,10 @@ async def arm(runner, source_units, window, initial, following, prompts, *, nonc
             prompts["split"],
             translation_prompt=prompts["translation"],
             nonce=nonce,
-            protected_prefix_chars=history.reconstructions.protected_prefix_for(target.unit_id),
         )
         apply_result(history, target, result)
+        if history.reconstructions.effective_blocks()[: len(prefix)] != prefix:
+            raise AssertionError("Paragraph outside the review window changed")
         steps.append(
             {
                 "input": job,
@@ -60,8 +61,6 @@ async def arm(runner, source_units, window, initial, following, prompts, *, nonc
     expected = window["english"] + " " + " ".join(u.en_text for u in following)
     if " ".join(b.en_text for b in blocks).split() != expected.split():
         raise AssertionError("English coverage changed")
-    if tuple(blocks[: len(prefix)]) != prefix:
-        raise AssertionError("Previously stable paragraph changed")
     expected_raw = [
         s.en_text for u in source_units[: following[-1].unit_id + 1] for s in u.raw_source_segments
     ]

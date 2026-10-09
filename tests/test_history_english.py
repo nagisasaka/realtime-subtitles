@@ -162,7 +162,7 @@ def test_production_translation_display_mapping_save_and_tail_preserve_raw(tmp_p
 
 def test_partial_tail_source_offsets_and_bad_model_edit_is_only_a_warning():
     h = TranslationHistory()
-    add(h, "Keep this. We need,")
+    add(h, "Keep this. Another thought. We need,")
     target = h.reconstructions.plan(add(h, "More capacity."))
     calls = asyncio.run(
         reconstruct(
@@ -170,10 +170,10 @@ def test_partial_tail_source_offsets_and_bad_model_edit_is_only_a_warning():
             target,
             [
                 {
-                    "end_tokens": [1, 5],
-                    "join_cleanup": [edit(4, True, True), edit(100, True, True)],
+                    "end_tokens": [1, 3, 7],
+                    "join_cleanup": [edit(6, True, True), edit(100, True, True)],
                 },
-                batch("これを残してください。", "もっと容量が必要です。"),
+                batch("これを残してください。", "別の考え。", "もっと容量が必要です。"),
             ],
         )
     )
@@ -181,8 +181,57 @@ def test_partial_tail_source_offsets_and_bad_model_edit_is_only_a_warning():
     assert h.reconstructions.entries()[0].cleanup_rejections
     assert h.reconstructions.entries()[0].applied
     target = h.reconstructions.plan(add(h, "For our users."))
-    assert target.en_text == "We need, More capacity. For our users."
-    assert fragment_start_tokens(target) == (2, 4)
+    assert target.en_text == "Another thought. We need, More capacity. For our users."
+    assert fragment_start_tokens(target) == (4, 6)
     assert render_english(target.en_text, h.reconstructions.base_edits_for(target.unit_id)) == (
-        "We need more capacity. For our users."
+        "Another thought. We need more capacity. For our users."
     )
+
+
+def test_revisiting_two_corrected_paragraphs_keeps_both_source_coordinate_maps():
+    h = TranslationHistory()
+    assembler = TranslationUnitAssembler(h.emit_unit)
+    for i, text in enumerate(("We need,", "More capacity.", "We use:", "The same tool.")):
+        assembler.accept(
+            h.record_segment(
+                {
+                    "message": "AddSegment",
+                    "segment": {"transcript": text, "speaker": "S1"},
+                    "metadata": {"start_time": i, "end_time": i + 1},
+                },
+                "s",
+            )
+        )
+    target = h.reconstructions.plan(h.segments()[-1])
+    asyncio.run(
+        reconstruct(
+            h,
+            target,
+            [
+                {"end_tokens": [3, 8], "join_cleanup": [edit(2, True, True), edit(6, True, True)]},
+                batch("さらに容量が必要です。", "同じツールを使います。"),
+            ],
+        )
+    )
+    raw = [asdict(s) for s in h.sources()]
+    target = h.reconstructions.plan(add(h, "New topic."))
+    assert render_english(target.en_text, h.reconstructions.base_edits_for(target.unit_id)) == (
+        "We need more capacity. We use the same tool. New topic."
+    )
+    asyncio.run(
+        reconstruct(
+            h,
+            target,
+            [
+                {"end_tokens": [3, 8, 10]},
+                batch("さらに容量が必要です。", "同じツールを使います。", "新しい話題です。"),
+            ],
+        )
+    )
+    assert h.reconstructions.entries()[-1].applied
+    assert [asdict(s) for s in h.sources()[:4]] == raw
+    assert [b.display_en_text for b in h.reconstructions.effective_blocks()] == [
+        "We need more capacity.",
+        "We use the same tool.",
+        "New topic.",
+    ]

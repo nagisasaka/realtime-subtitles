@@ -21,21 +21,21 @@ Speechmatics Translationは設定・使用しません。OpenAI Realtime Transla
 ### 履歴の英文分割 → チャンク一括翻訳
 
 最新枠はこれまでどおり2-final単位で即時翻訳します。別workerで、同じ話者・同じ認識sessionの
-履歴の**最後の1段落＋新しいTranslationUnit**だけを再構成します。
+履歴の**直近最大2段落＋新しいTranslationUnit**を再構成します。
 前回の後ろが `With our.`、続きが `Key. Business.` なら同じ対象として再検討できます。
 それより前の英日ペアは保持します。時間による保留は追加せず、新しいunitの到着を契機にします。
 
-対象は合計最大1,800文字、引き継ぐ段落は元の最大3 unitsまで（新しい1 unitを加えて最大4 units）。
-上限超過時は見直しをskipし、元の字幕を残します。過去全文を繰り返し送信しません。
-最初や直前の見直しが失敗した場合は、直前の元unit＋新unitを対象にします。
+対象は合計最大1,800文字。ASRが細切れでも、元のunit個数では打ち切りません。
+2段落では上限を超える場合は1段落で試し、それでも超える場合はskipして元の字幕を残します。
+過去全文を繰り返し送信しません。未再構成／失敗時の元unitも1段落として扱います。
 queue待ち中に前の処理が完了する場合があるため、引き継ぐ段落は専用workerの実行開始時に確定します。
 
 処理順序は次のとおりです。通常は1範囲につきLunaを**2回**呼び出します。
 
 1. 英語を結合し、最初のAPI呼び出しで意味のまとまりの**英文境界と接続箇所の表記修正**を決めます。
    LLMは末尾token indexと限定した編集指示を返し、アプリが元の英文を切り出してチャンクIDを付けます。
-   引き継ぐ検証済み段落の内部に新しい境界は作りません。その段落と続きを結ぶ境界は変更できます。
-   この制限は文法を推測するルールではなく、既存段落を再び細切れにしないための編集範囲の制限です。
+   直近の段落内部も再分割できます。続きを得た後に、未完結句や列挙の途中の境界を見直します。
+   それより古い段落は保持します。意味上正しいLLMの境界を既存段落の保護規則で取り消しません。
 2. 境界を確定した後、2回目のAPI呼び出しで全チャンクをまとめて日本語へ翻訳します。
    各チャンクの訳は `{id, ja}` で受け取り、返却順に依存せず英日を対応付けます。
    過去の確定英文（最大5 TranslationUnits）をCONTEXTとし、対象チャンク群も一緒に読ませますが、
@@ -58,6 +58,10 @@ APIの呼び出し回数は従来通り2段階で、表記修正だけの追加r
 [Responsesの構造化出力](https://developers.openai.com/api/docs/guides/structured-outputs)
 を使用し、英文tokenの完全被覆、IDの欠落・重複・範囲外、日本語の空欄を検査します。
 数値・通貨・単位等は**チャンクごと**に既存Validatorで検査します。
+`40 to 50 minutes`と`40分から50分`は範囲両端の単位を揃えて換算します。
+ASRの`10 to 15`と訳の`10〜15分`のように数値が同じで片側だけ単位がある場合は、
+単位の確証がないため`unit_omitted`警告として保存し、数値誤りと断定して再翻訳しません。
+単位を原文へ補完せず、明示された異なる数値・通貨・単位の重大な検証は継続します。
 重大な翻訳検証エラーでは、英文境界と入力を固定して**一括翻訳だけ最大1回**再試行します。
 通信エラーにも既存のbounded retryが適用されます（翻訳処理全体で最大2 attempt）。
 構造不正は再試行せず棄却します。API失敗・検証失敗・停止時の打ち切りでも元の表示を維持します。
@@ -83,6 +87,12 @@ TXTの時刻は元unitの範囲であり、切り出した文字位置の正確�
 同じ既知話者の範囲、または連続する話者不明の範囲を対象とし、既知話者との境界／session／Clearを越えません。
 話者不明（UU/SU/ラベル欠落）の連続も処理を継続します。同一人物とは推定せず、raw speaker情報を保持します。
 Diagnosticsの `history_reconstruction` で件数・queue・失敗状態を確認できます。
+2026-10-09の保存済み実発話による回帰確認では、5 units以上にまたがる`Taking on new challenges`、
+`If ... Jetro can provide ...`、`subsidiary or branch`の3例で対象箇所が同じ段落になりました。
+この短い3例の分割＋翻訳API処理は3.074〜5.354秒（録音受信・queue待ちは含まない）。
+`40〜50分／最後の10〜15分`も単位省略の警告のみで確定し、品質再翻訳は0回でした。
+原文は全例で保持。WSLの全テスト353件、Windowsのアプリ関連208件が成功しています。
+これは限定した回帰確認であり、一般的な分割品質や遅延を保証する測定ではありません。
 新方式の実測・テスト結果は [実装レポート](docs/history-split-first-implementation.md) に記載しています。
 分割プロンプト改善後のEarnings22試験は [改善評価](docs/history-dependency-prompt-evaluation.md) に記載しています。
 末尾段落を次の範囲へ引き継ぐ変更は [境界評価](docs/history-tail-review-evaluation.md) に記載しています。
@@ -448,7 +458,7 @@ GUI更新はTk main threadの`after`だけです。マイクは1つだけ開き�
 | `text_translation.py` | `TRANSLATION_CONCURRENCY` | 4 |
 | `text_translation.py` | `TRANSLATION_QUEUE_SIZE` | 48 |
 | `text_translation.py` | `REQUEST_TIMEOUT_SEC` / `STOP_DRAIN_SEC` | 20 / 5秒 |
-| `history_reconstruction.py` | `MAX_REVISION_UNITS` / `MAX_REVISION_CHARS` | 3 units / 1,800文字 |
+| `history_reconstruction.py` | `REVIEW_PARAGRAPHS` / `MAX_REVISION_CHARS` | 過去2段落 / 新unit込み1,800文字 |
 | `agent_stt.py` | `AGENT_RATE` / `emit_sentences` | 16000 Hz / true |
 | `audio_recording.py` | `ROTATE_SECONDS` | 1800秒（30分） |
 

@@ -3,7 +3,7 @@
 import re
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from difflib import SequenceMatcher
 
@@ -73,6 +73,7 @@ SCALE_PATTERN = re.compile(r"trillion|billion|million|thousand|[百千万億兆]
 class Quantity:
     value: Decimal
     unit: str | None
+    literal_value: Decimal = field(compare=False)
 
 
 def normalize(text):
@@ -81,7 +82,7 @@ def normalize(text):
 
 def quantities(text):
     text = normalize(text)
-    result = []
+    parsed = []
     for match in NUMBER.finditer(text):
         # GPT-6, v2.1 etc. are identifiers, not confidently parsed quantities.
         before = text[: match.start()].rstrip()
@@ -94,11 +95,64 @@ def quantities(text):
         # Bare "pounds" can mean weight, not currency. Never guess GBP from it.
         if not match["currency"] and (match["unit"] or "").lower() in {"pound", "pounds"}:
             unit = None
-        if unit in CONVERSIONS:
-            unit, multiplier = CONVERSIONS[unit]
-            value *= multiplier
-        result.append(Quantity(value, unit))
+        # A hyphen immediately between numbers is a range separator, not a
+        # negative upper endpoint. An explicit second minus remains negative.
+        if parsed and match["number"].startswith("-"):
+            previous_match, _ = parsed[-1]
+            if (
+                not text[previous_match.end() : match.start()].strip()
+                and not previous_match.group()[-1].isspace()
+            ):
+                value = abs(value)
+        parsed.append((match, Quantity(value, unit, value)))
+    # In "40 to 50 minutes" the trailing unit applies to both endpoints.
+    # Only explicit adjacent ranges share a unit; never infer one from context.
+    for i in range(1, len(parsed)):
+        left_match, left = parsed[i - 1]
+        right_match, right = parsed[i]
+        gap = text[left_match.end() : right_match.start()].strip()
+        if (
+            not gap
+            and right_match["number"].startswith("-")
+            and not left_match.group()[-1].isspace()
+        ):
+            gap = "-"
+        if re.fullmatch(r"to|から|[~〜～–—-]", gap, re.IGNORECASE):
+            if left.unit is None and right.unit is not None:
+                parsed[i - 1] = left_match, replace(left, unit=right.unit)
+            elif right.unit is None and left.unit is not None:
+                parsed[i] = right_match, replace(right, unit=left.unit)
+    result = []
+    for _, quantity in parsed:
+        if quantity.unit in CONVERSIONS:
+            unit, multiplier = CONVERSIONS[quantity.unit]
+            quantity = replace(quantity, value=quantity.value * multiplier, unit=unit)
+        result.append(quantity)
     return result
+
+
+def unmatched_quantities(source, translated):
+    """Match exact quantities first, then equally written numbers with omitted units.
+
+    A bare ASR "10 to 15" versus JA "10〜15分" is uncertain unit evidence,
+    not a confident 15 -> 900 numeric error. Preserve that uncertainty as a
+    warning; explicit incompatible units and changed values remain errors.
+    """
+    source, translated = list(source), list(translated)
+    for q in source[:]:
+        if q in translated:
+            source.remove(q)
+            translated.remove(q)
+    omitted = False
+    for q in source[:]:
+        for j, candidate in enumerate(translated):
+            one_unit_missing = (q.unit is None) != (candidate.unit is None)
+            if one_unit_missing and q.literal_value == candidate.literal_value:
+                source.remove(q)
+                translated.pop(j)
+                omitted = True
+                break
+    return source, translated, omitted
 
 
 def compact(text):
@@ -164,6 +218,13 @@ class TranslationValidator:
                 "number_mismatch", "warning", "Numbers may use unsupported written-number notation."
             )
         elif en and ja:
+            en, ja, omitted = unmatched_quantities(en, ja)
+            if omitted:
+                add(
+                    "unit_omitted",
+                    "warning",
+                    "Matching numbers have a unit on only one side; unit equivalence is uncertain.",
+                )
             ev, jv = Counter(q.value for q in en), Counter(q.value for q in ja)
             # Mixed Japanese compound magnitudes (1億2000万) and unsupported units are ambiguous.
             compound = bool(re.search(r"[億兆万]\s*\d", normalize(output)))

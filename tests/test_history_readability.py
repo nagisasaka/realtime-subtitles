@@ -29,13 +29,13 @@ def test_replay_uses_production_pairs_context_and_immutable_raw():
     original = deepcopy(rows)
     a = replay(rows)
     assert rows == original
-    assert len(a) == 5
-    assert a[0]["english"] == " ".join(f"Source {i}." for i in range(4))
-    assert a[0]["source_ids"] == tuple(range(4))
+    assert len(a) == 4
+    assert a[0]["english"] == " ".join(f"Source {i}." for i in range(6))
+    assert a[0]["source_ids"] == tuple(range(6))
     assert a[1]["context"] == [
         {"speaker": "S1", "text": f"Source {i}. Source {i + 1}."} for i in range(0, 2, 2)
     ]
-    assert len(a[0]["raw_sources"]) == 4
+    assert len(a[0]["raw_sources"]) == 6
 
 
 def test_partial_speaker_change_flushes_and_unknown_run_stays_separate():
@@ -425,7 +425,7 @@ def test_tail_eval_replay_and_seed_keep_original_raw_sources():
     seed(h, w, result)
     assert len(h.sources()) == 6
     target = h.reconstructions.plan(add_saved_unit(h, source.segments()[3]))
-    assert target.en_text == "Source 5. Source 6. Source 7."
+    assert target.en_text == " ".join(f"Source {i}." for i in range(8))
     assert h.reconstructions.effective_blocks()[0].ja_text == "前半"
     with pytest.raises(ValueError, match="EOS"):
         source_histories(rows[:-1])

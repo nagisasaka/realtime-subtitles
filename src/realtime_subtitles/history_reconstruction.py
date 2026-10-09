@@ -24,7 +24,7 @@ from .translation_history import TranslationUnit
 from .translation_validation import TranslationValidator
 
 MAX_REVISION_CHARS = 1800
-MAX_TAIL_UNITS = 3
+REVIEW_PARAGRAPHS = 2
 SPLIT_INSTRUCTIONS = """Divide FULL_ENGLISH into readable, meaningful English subtitle chunks.
 Choose boundaries and surface cleanup at ASR joins before translation. Return indexes
 and cleanup flags only; do not translate or generate replacement prose.
@@ -36,6 +36,9 @@ A chunk should contain a complete thought, including the words that complete it:
 - Keep a verb with its object/complement, and a list introduction with its items.
 - Keep a relative clause with its referent, and a prepositional/adverbial phrase with
   the clause it qualifies. A leading modifier belongs with the following clause.
+- Keep an introductory condition (if/unless/when) with the statement it qualifies,
+  even when ASR inserts a period before the statement. "If you plan to expand.
+  Our team. Can help." is one thought, not a standalone condition plus its answer.
 - Keep a dependent continuation with its governing thought across ASR periods.
 Before returning each boundary, check BOTH sides: does it strand a subject, verb,
 modifier or continuation whose completion is available on the other side? If so,
@@ -73,6 +76,12 @@ statement followed by "As such" and its consequence belongs in one chunk. A trai
 same explanation. Do not merge unrelated announcements, a new speaker turn, or a
 new action just because it shares the topic. Retain every word and all source order.
 Do not generate replacement words or reordered English. CONTEXT is not part of the chunks.
+Recent history is provisional: new speech can complete a phrase previously left
+unfinished. Reconsider boundaries inside this whole passage, even inside an older
+paragraph. Keep valid complete thoughts together; do not strand a subject/modal
+("Our team. Can" / "provide support"), a phrasal verb ("Taking" / "on new challenges"),
+or list alternatives ("a Japanese subsidiary." / "Or branch.") on opposite cards.
+ASR periods do not make these continuations independent thoughts.
 Also assess JOIN_CANDIDATES at original ASR fragment boundaries, using the meaning
 of the whole passage. Return join_cleanup ONLY for necessary surface corrections
 inside a single chunk: remove_previous_punctuation removes the preceding fragment's
@@ -135,7 +144,7 @@ class ReconstructedParagraph:
     edits: tuple[EnglishEdit, ...] = ()
 
 
-def split_english(english, decision, *, protected_prefix_chars=0):
+def split_english(english, decision):
     """Check complete, ordered token coverage and slice the original, never model prose."""
     tokens = list(re.finditer(r"\S+", english))
     if not tokens or not decision.end_tokens:
@@ -148,22 +157,6 @@ def split_english(english, decision, *, protected_prefix_chars=0):
         next_token = end + 1
     if next_token != len(tokens):
         raise ValueError("English coverage incomplete")
-    if not 0 <= protected_prefix_chars <= len(english):
-        raise ValueError("Invalid protected history prefix")
-    # Keep an already validated paragraph intact. The model may join it to the
-    # new speech, but cannot fragment its interior again. Validate raw coverage
-    # BEFORE this restriction so malformed model decisions are never repaired.
-    if protected_prefix_chars:
-        ends = [c.en_end for c in chunks if c.en_end >= protected_prefix_chars]
-        if not ends:
-            raise ValueError("Protected prefix extends beyond source tokens")
-        starts = [chunks[0].en_start] + [
-            next(t.start() for t in tokens if t.start() >= end) for end in ends[:-1]
-        ]
-        chunks = [
-            EnglishChunk(i, start, end)
-            for i, (start, end) in enumerate(zip(starts, ends, strict=True))
-        ]
     return tuple(chunks)
 
 
@@ -257,11 +250,7 @@ class ReconstructionTranslator(OpenAITranslator):
                 },
                 EnglishSplit,
             )
-            chunks = split_english(
-                target.en_text,
-                decision,
-                protected_prefix_chars=self.history.protected_prefix_for(target.unit_id),
-            )
+            chunks = split_english(target.en_text, decision)
             chunks, rejected = apply_join_cleanup(
                 target.en_text, chunks, decision.join_cleanup, starts, base_edits
             )
@@ -390,8 +379,8 @@ def replacement_slice(blocks, starts, start, end, revision_id):
 class ReconstructionHistory:
     """TranslationWorker adapter over a separate immutable revision namespace.
 
-    Share the owner's RLock/journal for atomic UI and autosave reads. Planning is
-    O(1): only the preceding unit/group can be joined, never a full-history search.
+    Share the owner's RLock/journal for atomic UI and autosave reads. Review only
+    a bounded recent paragraph window; never scan or rewrite the full history.
     """
 
     def __init__(self, owner):
@@ -440,24 +429,44 @@ class ReconstructionHistory:
         tail = self._by_end.get(i - 1)
         if tail is None or tail.end != (i - 1, len(previous.en_text.strip())):
             return None
-        ids = tuple(range(tail.start[0], i + 1))
-        if len(ids) > MAX_TAIL_UNITS + 1:
-            return None
-        first = units[ids[0]]
-        if first.source_segment_ids[0] < self.owner._display_start:
-            return None
-        if any(
-            u.session_id != current.session_id or not same_speaker_group(u.speaker, current.speaker)
-            for u in units[ids[0] : i + 1]
-        ):
-            return None
-        en = tail.en_text + " " + current.en_text.strip()
-        if len(en) > MAX_REVISION_CHARS:
-            return None
-        return ids, tail, en
+        index = bisect_left(self._starts, tail.start)
+        selected, selection = [], None
+        for pos in range(index, max(-1, index - REVIEW_PARAGRAPHS), -1):
+            block = self._blocks[pos]
+            if selected and selected[0].break_before:
+                break
+            ids = tuple(range(block.start[0], i + 1))
+            group = units[ids[0] : i + 1]
+            if group[0].source_segment_ids[0] < self.owner._display_start or any(
+                u.session_id != current.session_id
+                or not same_speaker_group(u.speaker, current.speaker)
+                for u in group
+            ):
+                break
+            # Rebuild from raw unit coordinates, including whitespace between
+            # paragraphs. Keep source offsets and previously accepted edits exact.
+            offsets, offset = {}, -block.start[1]
+            for u in group:
+                offsets[u.unit_id] = offset
+                offset += len(u.en_text.strip()) + 1
+            en = " ".join(u.en_text.strip() for u in group)[block.start[1] :]
+            if len(en) > MAX_REVISION_CHARS:
+                break
+            selected.insert(0, block)
+            edits = tuple(
+                EnglishEdit(
+                    offsets[b.start[0]] + b.start[1] + e.start,
+                    offsets[b.start[0]] + b.start[1] + e.end,
+                    e.replacement,
+                )
+                for b in selected
+                for e in b.edits
+            )
+            selection = ids, block, en, edits
+        return selection
 
     def _target(self, current, identity, selection, queued_at):
-        ids, tail, en = selection
+        ids, tail, en, _ = selection
         selected = [self.owner._segments[i] for i in ids]
         first = selected[0]
         return TranslationUnit(
@@ -485,7 +494,7 @@ class ReconstructionHistory:
             selection = self._selection(current)
             if selection is None:
                 return None
-            ids, tail, _ = selection
+            ids, tail, _, edits = selection
             target = self._target(
                 current, len(self._entries), selection, round(self.clock() * 1000)
             )
@@ -496,7 +505,7 @@ class ReconstructionHistory:
                 target,
                 first_unit_offset=tail.start[1],
                 parent_revision_id=tail.revision_id if tail.revision_id >= 0 else None,
-                base_edits=tail.edits,
+                base_edits=edits,
             )
             self._entries.append(revision)
             self._counts["pending"] = self._counts.get("pending", 0) + 1
@@ -513,7 +522,7 @@ class ReconstructionHistory:
             if selection is None:
                 self.update_translation(revision_id, "skipped", error="tail_limit_or_boundary")
                 return None
-            ids, tail, _ = selection
+            ids, tail, _, edits = selection
             target = self._target(
                 current, revision_id, selection, old.translation.assembled_monotonic_ms
             )
@@ -523,7 +532,7 @@ class ReconstructionHistory:
                 translation=target,
                 first_unit_offset=tail.start[1],
                 parent_revision_id=tail.revision_id if tail.revision_id >= 0 else None,
-                base_edits=tail.edits,
+                base_edits=edits,
             )
             self._entries[revision_id] = new
             if new != old:
@@ -620,14 +629,6 @@ class ReconstructionHistory:
                 new = replace(old, cleanup_rejections=rejected)
                 self._entries[revision_id] = new
                 self._record(new)
-
-    def protected_prefix_for(self, revision_id):
-        with self.owner._lock:
-            revision = self._entries[revision_id]
-            if revision.parent_revision_id is None:
-                return 0
-            current = self.owner._segments[revision.unit_ids[-1]]
-            return len(revision.translation.en_text) - len(current.en_text.strip()) - 1
 
     def usage_for(self, revision_id):
         with self.owner._lock:

@@ -182,8 +182,6 @@ async def execute(directory, manifest, api, *, name="comparison", ids=None, nonc
         for unit in units[: w["unit_ids"][-1] + 1]:
             add_saved_unit(history, unit)
         seed(history, w, case["initial"])
-        prefix = history.reconstructions.effective_blocks()
-        prefix = tuple(b for b in prefix if b.start[0] >= w["unit_ids"][0])[:-1]
         steps, following = [], []
         for data in case["following"]:
             data = dict(data)
@@ -212,6 +210,9 @@ async def execute(directory, manifest, api, *, name="comparison", ids=None, nonc
             if target is None:
                 steps.append({"unit_id": current.unit_id, "status": "skipped"})
                 continue
+            revision = history.reconstructions.entries()[target.unit_id]
+            start = (revision.unit_ids[0], revision.first_unit_offset)
+            prefix = tuple(b for b in history.reconstructions.effective_blocks() if b.start < start)
             window = {
                 "id": w["id"] + f"-new-{current.unit_id}",
                 "english": target.en_text,
@@ -222,9 +223,10 @@ async def execute(directory, manifest, api, *, name="comparison", ids=None, nonc
                 manifest["split_prompt"],
                 translation_prompt=manifest["translation_prompt"],
                 nonce=nonce,
-                protected_prefix_chars=history.reconstructions.protected_prefix_for(target.unit_id),
             )
             apply_result(history, target, result)
+            if history.reconstructions.effective_blocks()[: len(prefix)] != prefix:
+                raise AssertionError("Paragraph outside the review window changed")
             steps.append(
                 {
                     "unit_id": current.unit_id,
@@ -239,7 +241,7 @@ async def execute(directory, manifest, api, *, name="comparison", ids=None, nonc
         ]
         expected = w["english"] + " " + baseline_window["english"]
         preserved = " ".join(b.en_text for b in blocks).split() == expected.split()
-        if not preserved or tuple(blocks[: len(prefix)]) != prefix:
+        if not preserved:
             raise AssertionError("Source coverage or retained prefix changed")
         report["cases"][w["id"]] = {
             "baseline_window": baseline_window,

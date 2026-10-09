@@ -1,6 +1,6 @@
 import pytest
 
-from realtime_subtitles.translation_validation import TranslationValidator, serious
+from realtime_subtitles.translation_validation import TranslationValidator, quantities, serious
 
 
 @pytest.mark.parametrize(
@@ -103,3 +103,58 @@ def test_unicode_minus_and_explicit_currency_are_unambiguous():
         i.code == "currency_mismatch" and i.severity == "error"
         for i in v.validate("USD 2 million", "200万円")
     )
+
+
+@pytest.mark.parametrize(
+    ("en", "ja"),
+    [
+        ("40 to 50 minutes", "40分から50分"),
+        ("40 to 50 minutes", "40〜50分"),
+        ("40-50 minutes", "40～50分"),
+        ("10 to 15 seconds", "10秒から15秒"),
+        ("25 to 30 percent", "25〜30%"),
+        ("2 to 3 hours", "120〜180分"),
+        ("-20 to -10 meters", "-20〜-10メートル"),
+    ],
+)
+def test_explicit_ranges_share_units_before_conversion(en, ja):
+    assert quantities(en) == quantities(ja)
+    assert not TranslationValidator().validate(en, ja)
+
+
+def test_recorded_session_minutes_omission_only_warns_without_retry():
+    en = (
+        "So the session is going to run for about 40 to 50 minutes or so. "
+        "We'll leave the last 10 to 15 uh, for questions if you have any."
+    )
+    for ja in (
+        "セッションは40〜50分ほどを予定しています。最後の10〜15分は質問をお受けします。",
+        "セッションは40分から50分ほどです。最後の10分から15分は質問をお受けします。",
+    ):
+        issues = TranslationValidator().validate(en, ja)
+        assert [i.code for i in issues] == ["unit_omitted"]
+        assert not serious(issues)
+
+
+@pytest.mark.parametrize(
+    ("en", "ja"),
+    [
+        ("40 to 50 minutes", "40分から60分"),
+        ("40 to 50 minutes", "40〜50秒"),
+        ("25 to 30 percent", "25〜30人"),
+        ("10 to 15", "10〜16分"),
+        ("$2 million", "200万トークン"),
+        ("$2 to $3", "2〜3ユーロ"),
+    ],
+)
+def test_range_and_omitted_unit_support_does_not_hide_clear_mismatches(en, ja):
+    assert serious(TranslationValidator().validate(en, ja))
+
+
+def test_unitless_quantity_matching_does_not_reuse_a_translated_number():
+    issues = TranslationValidator().validate("10 to 15 minutes, then 10 to 15", "10〜15分")
+    assert any(i.code == "number_mismatch" for i in issues)
+
+
+def test_separate_negative_value_is_not_read_as_a_range_endpoint():
+    assert [q.value for q in quantities("Offsets: 10 -15.")] == [10, -15]
