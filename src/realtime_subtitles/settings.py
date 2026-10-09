@@ -18,11 +18,15 @@ class Settings:
     audio_monitor: bool = False
     geometry: str = ""
     geometry_dpi: int = 0
-    english_size: int = 30
+    english_size: int = 27
     japanese_size: int = 18
-    subtitle_layout_version: int = 2
-    english_weight: str = "bold"
+    live_english_size: int = 30
+    live_japanese_size: int = 18
+    subtitle_layout_version: int = 3
+    english_weight: str = "normal"
     japanese_weight: str = "normal"
+    live_english_weight: str = "bold"
+    live_japanese_weight: str = "normal"
     transparency: int = 25
     always_on_top: bool = True
 
@@ -44,17 +48,35 @@ class Settings:
         result.english_size = max(8, min(64, result.english_size))
         result.japanese_size = max(8, min(64, result.japanese_size))
         version = data.get("subtitle_layout_version", 1)
+        legacy = type(version) is not int or version < 3
+        if legacy and type(data.get("english_size")) is not int:
+            result.english_size = 30
         if not isinstance(version, int) or version < 2:
             # The previous UI used Japanese as a full-size standalone caption.
             result.japanese_size = max(
                 8, min(result.japanese_size, round(result.english_size * 0.6))
             )
-        result.subtitle_layout_version = 2
+        if legacy:
+            # Previously EN history was 90% of the shared size, always normal.
+            # Preserve the visible sizes while giving all four fonts their own controls.
+            result.live_english_size = result.english_size
+            result.live_japanese_size = result.japanese_size
+            result.live_english_weight = data.get("english_weight", "bold")
+            result.live_japanese_weight = result.japanese_weight
+            result.english_size = max(8, round(result.english_size * 0.9))
+            result.english_weight = "normal"
+        result.subtitle_layout_version = 3
+        for name in ("english_size", "japanese_size", "live_english_size", "live_japanese_size"):
+            setattr(result, name, max(8, min(64, getattr(result, name))))
         result.transparency = max(0, min(70, result.transparency))
-        if result.english_weight not in {"normal", "bold"}:
-            result.english_weight = "bold"
-        if result.japanese_weight not in {"normal", "bold"}:
-            result.japanese_weight = "normal"
+        for name in (
+            "english_weight",
+            "japanese_weight",
+            "live_english_weight",
+            "live_japanese_weight",
+        ):
+            if getattr(result, name) not in ("normal", "bold"):
+                setattr(result, name, "bold" if name == "live_english_weight" else "normal")
         if result.input_source not in {"microphone", "audio_file"}:
             result.input_source = "microphone"
         if not re.fullmatch(r"\d{3,5}x\d{3,5}[+-]\d{1,6}[+-]\d{1,6}", result.geometry):

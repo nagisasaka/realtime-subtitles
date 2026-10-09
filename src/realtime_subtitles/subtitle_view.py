@@ -61,6 +61,21 @@ def translation_caption(text, status):
     return "翻訳検証エラー" if status == "validation_failed" else "未翻訳"
 
 
+def changed_history_ranges(before, after):
+    """Compare authoritative source boundaries, independent of JA/revision IDs."""
+    previous = {(block.start, block.end) for block in before}
+    return {(block.start, block.end) for block in after} - previous
+
+
+def blend_color(start, end, fraction):
+    fraction = max(0.0, min(1.0, fraction))
+    channels = []
+    for offset in (1, 3, 5):
+        first, last = int(start[offset : offset + 2], 16), int(end[offset : offset + 2], 16)
+        channels.append(round(first + (last - first) * fraction))
+    return "#" + "".join(f"{value:02x}" for value in channels)
+
+
 def wrap_subtitle(text, measure, width, max_lines=2):
     """Pixel wrapping with word boundaries; omit old lines without changing history.
 

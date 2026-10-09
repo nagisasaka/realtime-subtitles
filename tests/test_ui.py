@@ -103,11 +103,15 @@ def test_controls_fonts_dpi_drag_clickthrough_and_missing_file(app, tmp_path):
     assert app.start_button.winfo_viewable()
     app.en_size.set(32)
     app.ja_size.set(29)
+    app.live_en_size.set(36)
+    app.live_ja_size.set(21)
     app.en_weight.set("bold")
     app.ja_weight.set("normal")
     app._font_changed()
     app.pump()
-    assert app.en_font.cget("size") == -round(32 * app.scale)
+    assert app.en_font.cget("size") == -round(36 * app.scale)
+    assert app.confirmed_font.cget("size") == -round(32 * app.scale)
+    assert app.live_ja_font.cget("size") == -round(21 * app.scale)
     assert app.ja_font.cget("weight") == "normal"
     assert app.live_text.winfo_height() == app.en_font.metrics("linespace") * 2
     app.transparency.set(40)
@@ -149,6 +153,7 @@ def test_controls_fonts_dpi_drag_clickthrough_and_missing_file(app, tmp_path):
     app._save_settings()
     saved = Settings.load(app.settings_file)
     assert saved.input_source == "audio_file" and saved.english_size == 32
+    assert saved.live_english_size == 36 and saved.live_japanese_size == 21
     assert saved.audio_monitor is True
 
 
@@ -453,8 +458,8 @@ def test_retranslated_paragraphs_always_render_newest_first(app, coalesced):
 def test_monitor_dpi_updates_pixel_fonts_and_layout_without_recreating_widgets(app, monkeypatch):
     dpi = [168]
     monkeypatch.setattr("realtime_subtitles.ui.window_dpi", lambda root: dpi[0])
-    app.en_size.set(20)
-    app.ja_size.set(14)
+    app.live_en_size.set(20)
+    app.live_ja_size.set(14)
     app._font_changed()
     widgets = dict(app.caption_widgets)
     history = app.history_text
@@ -466,22 +471,22 @@ def test_monitor_dpi_updates_pixel_fonts_and_layout_without_recreating_widgets(a
         app.pump()
         assert app.scale == value / 96
         assert app.en_font.cget("size") == en
-        assert app.ja_font.cget("size") == ja
+        assert app.live_ja_font.cget("size") == ja
         assert app.live_text.winfo_height() == app.en_font.metrics("linespace") * 2
-        assert app.live_text.winfo_y() == app.ja_font.metrics("linespace") * 2 + round(
+        assert app.live_text.winfo_y() == app.live_ja_font.metrics("linespace") * 2 + round(
             4 * app.scale
         )
         assert app.live_text.winfo_x() == 0
         assert app.live_text.winfo_width() == app.captions.winfo_width()
         assert app.history_frame.winfo_width() == app.captions.winfo_width()
-        assert app.en_size.get() == 20 and app.ja_size.get() == 14
+        assert app.live_en_size.get() == 20 and app.live_ja_size.get() == 14
         assert dict(app.caption_widgets) == widgets and app.history_text is history
     # Half-written settings must not be normalized/overwritten by a monitor move.
-    app.en_size.set("")
+    app.live_en_size.set("")
     dpi[0] = 168
     app.pump()
     assert app.en_font.cget("size") == -35
-    assert app.en_size._tk.globalgetvar(app.en_size._name) == ""
+    assert app.live_en_size._tk.globalgetvar(app.live_en_size._name) == ""
 
 
 def native_monitor_origins():
@@ -513,7 +518,7 @@ def test_native_monitor_roundtrip_keeps_logical_geometry(app):
 
     rectangles = native_monitor_origins()
     states = []
-    app.en_size.set(20)
+    app.live_en_size.set(20)
     app._font_changed()
     for left, top in [rectangles[0], rectangles[1], rectangles[0]]:
         app.root.geometry(f"+{left + 100}+{top + 100}")
@@ -580,7 +585,7 @@ def test_native_settings_and_subtitles_on_separate_displays(app):
     from realtime_subtitles.ui import window_dpi
 
     first, second = native_monitor_origins()[:2]
-    app.en_size.set(20)
+    app.live_en_size.set(20)
     app._font_changed()
     for main, dialog in [(first, second), (second, first), (first, second)]:
         app.root.geometry(f"+{main[0] + 100}+{main[1] + 100}")
@@ -640,3 +645,120 @@ def test_tail_replacement_keeps_prefix_widget_anchor_and_live_frame(app):
     app.pump()
     assert "古い単独訳" not in widget.get("1.0", "end")
     assert h.saved_text().count("With our") == 1
+
+
+def test_latest_wrap_keeps_a_blank_line_above_history(app):
+    h = app.client.history
+    make_unit(h, event("Already in history."), "s")
+    app._resize_for_dpi(round(650 * app.scale), round(580 * app.scale))
+    app.pump()
+    history_y = app.history_frame.winfo_y()
+    for text, expected_lines in [("Short.", 1), ("A long current English sentence. " * 20, 2)]:
+        unit = make_unit(h, event(text, 2), "s")
+        h.update_translation(unit.unit_id, "completed", text="現在の日本語字幕です。" * 30)
+        app.pump()
+        assert len(app.live_text.cget("text").splitlines()) == expected_lines
+        assert len(app.ja_text.cget("text").splitlines()) == 2
+        assert app.history_frame.winfo_y() == history_y
+        bottom = app.live_text.winfo_y() + app.live_text.winfo_height()
+        assert app.history_frame.winfo_y() - bottom == app.en_font.metrics("linespace")
+
+
+def test_latest_and_history_four_font_sizes_are_independent(app):
+    from realtime_subtitles.settings import Settings
+
+    controls = [
+        (app.live_en_size, app.en_font, 36, "live_english_size"),
+        (app.live_ja_size, app.live_ja_font, 22, "live_japanese_size"),
+        (app.en_size, app.confirmed_font, 25, "english_size"),
+        (app.ja_size, app.ja_font, 16, "japanese_size"),
+    ]
+    widgets = app.live_text, app.ja_text, app.history_text
+    for variable, face, value, _ in controls:
+        unchanged = [
+            (other, other.cget("size")) for _, other, _, _ in controls if other is not face
+        ]
+        variable.set(value)
+        app._font_changed()
+        app.pump()
+        assert face.cget("size") == -round(value * app.scale)
+        assert all(other.cget("size") == size for other, size in unchanged)
+    assert widgets == (app.live_text, app.ja_text, app.history_text)
+    app._save_settings()
+    saved = Settings.load(app.settings_file)
+    assert all(getattr(saved, name) == value for _, _, value, name in controls)
+
+
+def test_changed_split_only_highlights_and_fades_without_moving_reader(app):
+    from realtime_subtitles.history_reconstruction import ReconstructedParagraph
+    from realtime_subtitles.ui import BG, HISTORY_FLASH_COLOR
+
+    now = [100.0]
+    app._animation_clock = lambda: now[0]
+    h = app.client.history
+    for i in range(15):
+        make_unit(h, event(f"Earlier sentence {i}.", i), "s")
+    unchanged = make_unit(h, event("Keep this paragraph.", 16), "s")
+    last = make_unit(h, event("First idea. Second idea.", 17), "s")
+    target = h.reconstructions.plan(last)
+    h.set_partial("Live words", "S1")
+    app.pump()
+    text = app.history_text
+    text.yview("pair_8_en")
+    app.pump()
+    anchor = text.get("@0,0", "@0,0 lineend")
+    bounds = app.live_text.winfo_y(), app.history_frame.winfo_y(), app.root.winfo_height()
+    parts = []
+    for en, ja in [
+        (unchanged.en_text, "この段落を維持。"),
+        ("First idea.", "一つ目。"),
+        ("Second idea.", "二つ目。"),
+    ]:
+        offset = target.en_text.index(en)
+        parts.append(ReconstructedParagraph(offset, offset + len(en), ja))
+    h.reconstructions.set_paragraphs(target.unit_id, tuple(parts))
+    h.reconstructions.update_translation(target.unit_id, "completed", text="再翻訳済み")
+    app.pump()
+    blocks = [b for b in app._history_blocks if b.revision_id == target.unit_id]
+    assert len(app._history_flashes) == 2
+    assert (blocks[0].start, blocks[0].end) not in app._history_flashes
+    assert not any(
+        t.startswith("revision_flash_") for t in text.tag_names(f"block_{blocks[0].key}_en")
+    )
+    for block in blocks[1:]:
+        tag, _ = app._history_flashes[block.start, block.end]
+        assert text.tag_cget(tag, "background") == HISTORY_FLASH_COLOR
+        assert tag in text.tag_names(f"block_{block.key}_ja")
+        assert tag in text.tag_names(f"block_{block.key}_en")
+    flashes = dict(app._history_flashes)
+    now[0] += 0.55
+    app.pump()
+    assert all(
+        text.tag_cget(tag, "background") not in (BG, HISTORY_FLASH_COLOR)
+        for tag, _ in flashes.values()
+    )
+    # Same EN ranges with a different JA/revision notification must not flash again.
+    h.reconstructions.update_translation(target.unit_id, "completed", text="再通知")
+    app.pump()
+    assert app._history_flashes == flashes
+    now[0] += 0.5
+    app.pump()
+    assert not app._history_flashes and app._flash_after_id is None
+    assert not any(t.startswith("revision_flash_") for t in text.tag_names())
+    assert text.get("@0,0", "@0,0 lineend") == anchor
+    assert (app.live_text.winfo_y(), app.history_frame.winfo_y(), app.root.winfo_height()) == bounds
+
+
+def test_clear_cancels_in_progress_history_fade(app):
+    h = app.client.history
+    make_unit(h, event("The landscape is"), "s")
+    last = make_unit(h, event("changing.", 2), "s")
+    target = h.reconstructions.plan(last)
+    h.set_partial("Next words", "S1")
+    complete_revision(h, target, "状況は変わっています。")
+    app.pump()
+    assert app._history_flashes and app._flash_after_id is not None
+    h.clear_display()
+    app.pump()
+    assert not app._history_flashes and app._flash_after_id is None
+    assert not any(t.startswith("revision_flash_") for t in app.history_text.tag_names())

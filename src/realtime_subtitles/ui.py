@@ -6,6 +6,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from bisect import bisect_left
 from datetime import datetime
@@ -19,9 +20,12 @@ from .history_reconstruction import original_block, replacement_slice
 from .live_client import LiveClient
 from .realtime_api import State
 from .settings import Settings
-from .subtitle_view import translation_caption, wrap_subtitle
+from .subtitle_view import blend_color, changed_history_ranges, translation_caption, wrap_subtitle
 
 BG = "#111318"
+HISTORY_FLASH_COLOR = "#344b65"
+HISTORY_FLASH_HOLD_SEC = 0.12
+HISTORY_FLASH_DURATION_SEC = 1.0
 
 
 def configure_dark_style(root):
@@ -247,6 +251,10 @@ class SubtitleApp:
         self._history_blocks = []
         self._history_starts = []
         self._history_block_runs = {}
+        self._history_flashes = {}
+        self._flash_serial = 0
+        self._flash_after_id = None
+        self._animation_clock = time.monotonic
         self.settings_file = settings_file
         self.settings = Settings.load(settings_file)
         if audio_file is not None:
@@ -384,32 +392,44 @@ class SubtitleApp:
         self.ja_size = tk.IntVar(value=self.settings.japanese_size)
         self.en_weight = tk.StringVar(value=self.settings.english_weight)
         self.ja_weight = tk.StringVar(value=self.settings.japanese_weight)
-        for label, var, weight in [
-            ("英語 px", self.en_size, self.en_weight),
-            ("日本語 px", self.ja_size, self.ja_weight),
+        self.live_en_size = tk.IntVar(value=self.settings.live_english_size)
+        self.live_ja_size = tk.IntVar(value=self.settings.live_japanese_size)
+        self.live_en_weight = tk.StringVar(value=self.settings.live_english_weight)
+        self.live_ja_weight = tk.StringVar(value=self.settings.live_japanese_weight)
+        for title, en, en_weight, ja, ja_weight in [
+            (
+                "最新字幕",
+                self.live_en_size,
+                self.live_en_weight,
+                self.live_ja_size,
+                self.live_ja_weight,
+            ),
+            ("履歴", self.en_size, self.en_weight, self.ja_size, self.ja_weight),
         ]:
-            ttk.Label(appearance, text=label).pack(side="left", padx=(0, 4))
-            box = ttk.Spinbox(
-                appearance, from_=8, to=64, width=4, textvariable=var, command=self._font_changed
-            )
-            box.pack(side="left", padx=(0, 4))
-            box.bind("<Return>", lambda _: self._font_changed())
-            box.bind("<FocusOut>", lambda _: self._font_changed())
-            weight_box = ttk.Combobox(
-                appearance,
-                textvariable=weight,
-                values=["normal", "bold"],
-                state="readonly",
-                width=7,
-            )
-            weight_box.pack(side="left", padx=(0, 14))
-            weight_box.bind("<<ComboboxSelected>>", lambda _: self._font_changed())
-        ttk.Label(appearance, text="透明度").pack(side="left")
+            row = ttk.Frame(appearance)
+            row.pack(fill="x", pady=(0, 6))
+            ttk.Label(row, text=title, width=9).pack(side="left")
+            for label, var, weight in [("英語 px", en, en_weight), ("日本語 px", ja, ja_weight)]:
+                ttk.Label(row, text=label).pack(side="left", padx=(0, 4))
+                box = ttk.Spinbox(
+                    row, from_=8, to=64, width=4, textvariable=var, command=self._font_changed
+                )
+                box.pack(side="left", padx=(0, 4))
+                box.bind("<Return>", lambda _: self._font_changed())
+                box.bind("<FocusOut>", lambda _: self._font_changed())
+                weight_box = ttk.Combobox(
+                    row, textvariable=weight, values=["normal", "bold"], state="readonly", width=7
+                )
+                weight_box.pack(side="left", padx=(0, 14))
+                weight_box.bind("<<ComboboxSelected>>", lambda _: self._font_changed())
+        opacity = ttk.Frame(appearance)
+        opacity.pack(fill="x")
+        ttk.Label(opacity, text="透明度").pack(side="left")
         self.transparency = tk.DoubleVar(value=self.settings.transparency)
         self.transparency_text = tk.StringVar(value=f"{self.settings.transparency}%")
-        ttk.Label(appearance, textvariable=self.transparency_text, width=5).pack(side="right")
+        ttk.Label(opacity, textvariable=self.transparency_text, width=5).pack(side="right")
         ttk.Scale(
-            appearance,
+            opacity,
             from_=0,
             to=70,
             variable=self.transparency,
@@ -620,23 +640,32 @@ class SubtitleApp:
         self.captions.pack(fill="both", expand=True, padx=24, pady=(8, 16))
         self._en_logical_size = self.en_size.get()
         self._ja_logical_size = self.ja_size.get()
+        self._live_en_logical_size = self.live_en_size.get()
+        self._live_ja_logical_size = self.live_ja_size.get()
         self.status_font = font.Font(family="Segoe UI", size=-round(12 * self.scale))
         self.en_font = font.Font(
             family="Segoe UI",
-            size=-round(self.en_size.get() * self.scale),
-            weight=self.en_weight.get(),
+            size=-round(self.live_en_size.get() * self.scale),
+            weight=self.live_en_weight.get(),
         )
         self.confirmed_font = font.Font(
-            family="Segoe UI", size=-round(self.en_size.get() * 0.9 * self.scale), weight="normal"
+            family="Segoe UI",
+            size=-round(self.en_size.get() * self.scale),
+            weight=self.en_weight.get(),
         )
         self.ja_font = font.Font(
             family="Yu Gothic UI",
             size=-round(self.ja_size.get() * self.scale),
             weight=self.ja_weight.get(),
         )
+        self.live_ja_font = font.Font(
+            family="Yu Gothic UI",
+            size=-round(self.live_ja_size.get() * self.scale),
+            weight=self.live_ja_weight.get(),
+        )
         self.caption_widgets = {}
         for name, face, color in [
-            ("ja", self.ja_font, "#aeb9cc"),
+            ("ja", self.live_ja_font, "#aeb9cc"),
             ("live", self.en_font, "#ffffff"),
         ]:
             widget = tk.Label(
@@ -690,11 +719,12 @@ class SubtitleApp:
         x = 0
         gap = round(4 * self.scale)
         live = self.en_font.metrics("linespace") * 2
-        ja = self.ja_font.metrics("linespace") * 2
+        ja = self.live_ja_font.metrics("linespace") * 2
         # Translation arrival never changes the live English's screen position.
         self.ja_text.place(x=x, y=0, width=width, height=ja)
         self.live_text.place(x=x, y=ja + gap, width=width, height=live)
-        history_y = ja + live + 2 * gap
+        # Keep one blank English line even when both live lines are occupied.
+        history_y = ja + gap + live + self.en_font.metrics("linespace")
         self.history_frame.place(
             x=x,
             y=history_y,
@@ -715,6 +745,7 @@ class SubtitleApp:
         text = self.history_text
         reset = self._history_display_start != display_start
         if reset:
+            self._clear_history_flashes()
             self._history_display_start = display_start
             self._history_pending.clear()
             self._history_rendered.clear()
@@ -848,6 +879,12 @@ class SubtitleApp:
             return  # Stale result or a parent not applicable to this display.
         lo, hi = selected
         removed = self._history_blocks[lo:hi]
+        changed_ranges = changed_history_ranges(removed, blocks)
+        new_ranges = {(b.start, b.end) for b in blocks}
+        for block in removed:
+            signature = (block.start, block.end)
+            if signature not in new_ranges:
+                self._remove_history_flash(signature)
         insertion, anchor, reading_removed = None, None, False
         for block in removed:
             start, end = f"block_{block.key}_start", f"block_{block.key}_end"
@@ -924,6 +961,7 @@ class SubtitleApp:
                 self._history_group_for_unit[identity] = revision.revision_id
                 affected.add(identity)
             self._history_block_runs[block.key] = runs
+            self._highlight_history_block(block, changed_ranges)
         self._history_blocks[lo:hi] = blocks
         self._history_starts[lo:hi] = [b.start for b in blocks]
         for identity in affected:
@@ -939,6 +977,51 @@ class SubtitleApp:
                     if local <= offset < local + length:
                         text.mark_set("reading_position", f"{mark}+{offset - local}c")
                         break
+
+    def _remove_history_flash(self, signature):
+        flash = self._history_flashes.pop(signature, None)
+        if flash:
+            self.history_text.tag_delete(flash[0])
+
+    def _clear_history_flashes(self):
+        if self._flash_after_id is not None:
+            self.root.after_cancel(self._flash_after_id)
+            self._flash_after_id = None
+        for signature in tuple(self._history_flashes):
+            self._remove_history_flash(signature)
+
+    def _highlight_history_block(self, block, changed_ranges):
+        signature = (block.start, block.end)
+        if signature in changed_ranges:
+            self._remove_history_flash(signature)
+            self._flash_serial += 1
+            tag = f"revision_flash_{self._flash_serial}"
+            self._history_flashes[signature] = (tag, self._animation_clock())
+            self.history_text.tag_configure(tag, background=HISTORY_FLASH_COLOR)
+        flash = self._history_flashes.get(signature)
+        if flash:
+            # An unchanged range may have moved during a neighboring replacement.
+            # Restore its ongoing fade without restarting its original deadline.
+            self.history_text.tag_add(flash[0], f"block_{block.key}_ja", f"block_{block.key}_end")
+            if self._flash_after_id is None and not self.closing:
+                self._flash_after_id = self.root.after(33, self._fade_history_flashes)
+
+    def _fade_history_flashes(self):
+        self._flash_after_id = None
+        now = self._animation_clock()
+        for signature, (tag, started) in tuple(self._history_flashes.items()):
+            elapsed = now - started
+            if elapsed >= HISTORY_FLASH_DURATION_SEC:
+                self._remove_history_flash(signature)
+            else:
+                fraction = (elapsed - HISTORY_FLASH_HOLD_SEC) / (
+                    HISTORY_FLASH_DURATION_SEC - HISTORY_FLASH_HOLD_SEC
+                )
+                self.history_text.tag_configure(
+                    tag, background=blend_color(HISTORY_FLASH_COLOR, BG, fraction)
+                )
+        if self._history_flashes and not self.closing:
+            self._flash_after_id = self.root.after(33, self._fade_history_flashes)
 
     def _render_history(self):
         previous_cursor = self._history_cursor
@@ -960,7 +1043,7 @@ class SubtitleApp:
             (
                 self.ja_text,
                 translation_caption(view.ja_text, view.translation_status),
-                self.ja_font,
+                self.live_ja_font,
                 2,
             ),
         ]
@@ -1058,11 +1141,15 @@ class SubtitleApp:
             except tk.TclError:
                 return round(abs(current_font.cget("size")) / self.scale)
 
-        en = read_size(self.en_size, self.en_font)
-        ja = read_size(self.ja_size, self.ja_font)
-        self.en_size.set(en)
-        self.ja_size.set(ja)
-        self._en_logical_size, self._ja_logical_size = en, ja
+        for name, variable, face in [
+            ("_en_logical_size", self.en_size, self.confirmed_font),
+            ("_ja_logical_size", self.ja_size, self.ja_font),
+            ("_live_en_logical_size", self.live_en_size, self.en_font),
+            ("_live_ja_logical_size", self.live_ja_size, self.live_ja_font),
+        ]:
+            value = read_size(variable, face)
+            variable.set(value)
+            setattr(self, name, value)
         self._apply_display_scale()
         self._schedule_save()
 
@@ -1110,12 +1197,17 @@ class SubtitleApp:
         # Named fonts/widgets are reused. Do not change global `tk scaling`:
         # a separate settings window may be on another monitor.
         self.en_font.configure(
-            size=-round(self._en_logical_size * self.scale), weight=self.en_weight.get()
+            size=-round(self._live_en_logical_size * self.scale), weight=self.live_en_weight.get()
+        )
+        self.live_ja_font.configure(
+            size=-round(self._live_ja_logical_size * self.scale), weight=self.live_ja_weight.get()
         )
         self.ja_font.configure(
             size=-round(self._ja_logical_size * self.scale), weight=self.ja_weight.get()
         )
-        self.confirmed_font.configure(size=-round(self._en_logical_size * 0.9 * self.scale))
+        self.confirmed_font.configure(
+            size=-round(self._en_logical_size * self.scale), weight=self.en_weight.get()
+        )
         self.status_font.configure(size=-round(12 * self.scale))
         style = ttk.Style(self.root)
         style.configure(
@@ -1169,14 +1261,15 @@ class SubtitleApp:
             f"{self.root.winfo_x():+d}{self.root.winfo_y():+d}"
         )
         self.settings.geometry_dpi = round(self.scale * 96)
-        try:
-            self.settings.english_size = self.en_size.get()
-            self.settings.japanese_size = self.ja_size.get()
-        except tk.TclError:
-            pass
+        self.settings.english_size = self._en_logical_size
+        self.settings.japanese_size = self._ja_logical_size
+        self.settings.live_english_size = self._live_en_logical_size
+        self.settings.live_japanese_size = self._live_ja_logical_size
         self.settings.always_on_top = self.topmost.get()
         self.settings.english_weight = self.en_weight.get()
         self.settings.japanese_weight = self.ja_weight.get()
+        self.settings.live_english_weight = self.live_en_weight.get()
+        self.settings.live_japanese_weight = self.live_ja_weight.get()
         self.settings.input_source = self.source.get()
         self.settings.audio_file = self.file_path.get()
         self.settings.audio_monitor = self.monitor_enabled.get()
@@ -1434,6 +1527,7 @@ class SubtitleApp:
             self._save_id = None
         self._save_settings()
         self.closing = True
+        self._clear_history_flashes()
         self.click_through.set(False)
         self._toggle_click_through()
         self.client.stop()

@@ -5,6 +5,33 @@ from realtime_subtitles.translation_assembler import TranslationUnitAssembler
 from realtime_subtitles.translation_history import TranslationHistory
 
 
+def test_segmentation_change_uses_source_ranges_not_text_or_japanese():
+    from types import SimpleNamespace
+
+    from realtime_subtitles.subtitle_view import changed_history_ranges
+
+    def block(start, end, key="old", ja="前の訳"):
+        return SimpleNamespace(start=start, end=end, key=key, ja_text=ja, en_text="Same words")
+
+    old = [block((0, 0), (0, 12)), block((1, 0), (1, 24))]
+    same = [block((0, 0), (0, 12), "r1", "別の訳"), block((1, 0), (1, 24), "r2")]
+    assert changed_history_ranges(old, same) == set()
+    split = [same[0], block((1, 0), (1, 10)), block((1, 11), (1, 24))]
+    assert changed_history_ranges(old, split) == {((1, 0), (1, 10)), ((1, 11), (1, 24))}
+    merged = [block((0, 0), (1, 24))]
+    assert changed_history_ranges(old, merged) == {((0, 0), (1, 24))}
+    # The same phrase at a different source occurrence is not an unchanged block.
+    assert changed_history_ranges(old, [block((2, 0), (2, 12))]) == {((2, 0), (2, 12))}
+
+
+def test_background_fade_has_exact_endpoints_and_no_overshoot():
+    from realtime_subtitles.subtitle_view import blend_color
+
+    assert blend_color("#344b65", "#111318", -1) == "#344b65"
+    assert blend_color("#344b65", "#111318", 2) == "#111318"
+    assert blend_color("#000000", "#ffffff", 0.5) == "#808080"
+
+
 def event(text, start=0, speaker="S1"):
     return {
         "message": "AddSegment",
